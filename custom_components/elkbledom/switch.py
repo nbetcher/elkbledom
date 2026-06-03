@@ -35,6 +35,8 @@ class BLEDOMMicSwitch(RestoreEntity, SwitchEntity):
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_enable"
         self._is_on = False
+        # Disabled by default unless the model opts into mic support.
+        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
 
     @property
     def available(self):

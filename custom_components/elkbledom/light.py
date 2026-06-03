@@ -267,30 +267,7 @@ class BLEDOMLight(RestoreEntity, LightEntity):
                     await self._instance.set_white(kwargs[ATTR_WHITE])
 
         
-        if ATTR_BRIGHTNESS in kwargs and kwargs[ATTR_BRIGHTNESS] != self.brightness:
-            brightness = kwargs[ATTR_BRIGHTNESS]
-            if self._attr_color_mode == ColorMode.RGB and self.rgb_color is not None:
-                # RGB mode: use native brightness or scale RGB
-                await self._instance.set_brightness(brightness)
-            elif self._attr_color_mode == ColorMode.COLOR_TEMP:
-                # COLOR_TEMP mode: re-apply current temp at new brightness
-                # (also handled below if ATTR_COLOR_TEMP_KELVIN is present, but
-                #  if only brightness changes we must apply it here)
-                if ATTR_COLOR_TEMP_KELVIN not in kwargs and CONF_COLOR_TEMP not in kwargs:
-                    current_temp = self.color_temp_kelvin
-                    if not current_temp:
-                        # No temp known yet — use midpoint of model range
-                        current_temp = (
-                            self._instance.min_color_temp_kelvin
-                            + self._instance.max_color_temp_kelvin
-                        ) // 2
-                    await self._instance.set_color_temp_kelvin(current_temp, brightness)
-            elif self._attr_color_mode == ColorMode.WHITE:
-                # WHITE mode: brightness is the white channel intensity
-                if ATTR_WHITE not in kwargs:
-                    await self._instance.set_white(brightness)
-
-        # Handle legacy color_temp (mireds) sent by some cards/automations
+        # Normalize legacy color_temp (mireds) sent by some cards/automations
         if CONF_COLOR_TEMP in kwargs and ATTR_COLOR_TEMP_KELVIN not in kwargs:
             try:
                 kwargs = dict(kwargs)
@@ -300,32 +277,62 @@ class BLEDOMLight(RestoreEntity, LightEntity):
             except Exception:
                 pass
 
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        # Whether a color/temp/white write below already applied the requested
+        # brightness, so we never send a redundant second brightness command.
+        brightness_handled = False
+
+        # --- Color temperature ---
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             self._attr_color_mode = ColorMode.COLOR_TEMP
             new_temp = kwargs[ATTR_COLOR_TEMP_KELVIN]
-            new_brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
-            if new_temp != self.color_temp_kelvin or ATTR_BRIGHTNESS in kwargs:
+            # Skip the (2-write) re-send when neither temp nor brightness changed.
+            if new_temp != self.color_temp_kelvin or brightness is not None:
+                new_brightness = brightness if brightness is not None else self.brightness
                 self._attr_effect = None
                 await self._instance.set_color_temp_kelvin(new_temp, new_brightness)
+            brightness_handled = True
 
+        # --- White ---
         if ATTR_WHITE in kwargs:
             if ColorMode.WHITE in self._attr_supported_color_modes:
                 self._attr_color_mode = ColorMode.WHITE
             self._attr_effect = None
             await self._instance.set_color(self._transform_color_brightness((255, 255, 255), kwargs[ATTR_WHITE]), is_base_color=False)
             await self._instance.set_white(kwargs[ATTR_WHITE])
+            brightness_handled = True
 
+        # --- RGB color: write the new base color, then brightness exactly once ---
         if ATTR_RGB_COLOR in kwargs:
             self._attr_color_mode = ColorMode.RGB
-            if kwargs[ATTR_RGB_COLOR] != self.rgb_color:
-                color = kwargs[ATTR_RGB_COLOR]
+            color = kwargs[ATTR_RGB_COLOR]
+            self._attr_effect = None
+            await self._instance.set_color(color, is_base_color=True)
+            target_brightness = brightness if brightness is not None else self.brightness
+            if target_brightness is not None and target_brightness < 255:
+                # Dim the freshly-set base color.
+                await self._instance.set_brightness(target_brightness)
+            else:
+                # Color already written at full scale; sync state without an extra write.
+                self._instance._brightness = 255
+            brightness_handled = True
+
+        # --- Brightness only (no color/temp/white attribute in this call) ---
+        if brightness is not None and not brightness_handled and brightness != self.brightness:
+            if self._attr_color_mode == ColorMode.COLOR_TEMP:
+                current_temp = self.color_temp_kelvin
+                if not current_temp:
+                    # No temp known yet — use midpoint of model range
+                    current_temp = (
+                        self._instance.min_color_temp_kelvin
+                        + self._instance.max_color_temp_kelvin
+                    ) // 2
                 self._attr_effect = None
-                # Save as base color and apply current brightness
-                await self._instance.set_color(color, is_base_color=True)
-                # Apply current brightness to the new color
-                current_brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
-                if current_brightness and current_brightness != 255:
-                    await self._instance.set_brightness(current_brightness)
+                await self._instance.set_color_temp_kelvin(current_temp, brightness)
+            elif self._attr_color_mode == ColorMode.WHITE:
+                await self._instance.set_white(brightness)
+            else:  # RGB or any other mode
+                await self._instance.set_brightness(brightness)
 
         if ATTR_EFFECT in kwargs and kwargs[ATTR_EFFECT] != self.effect:
             self._attr_effect = kwargs[ATTR_EFFECT]

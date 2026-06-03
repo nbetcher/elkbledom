@@ -8,6 +8,10 @@ CONF_DELAY = "delay"
 CONF_MODEL = "model"
 CONF_EFFECTS_CLASS = "effects_class"
 
+# Defaults for config/options
+DEFAULT_RESET = False
+DEFAULT_DELAY = 120
+
 # Brightness mode configuration
 CONF_BRIGHTNESS_MODE = "brightness_mode"
 BRIGHTNESS_MODES = ["auto", "rgb", "native"]
@@ -75,6 +79,17 @@ _effects_enums, _effects_lists_data = _load_effects_from_json()
 # This allows adding new effects in models.json without changing this file
 globals().update(_effects_enums)  # EFFECTS, EFFECTS_MELK, EFFECTS_MELK_OF10, etc.
 globals().update(_effects_lists_data)  # EFFECTS_list, EFFECTS_list_MELK, etc.
+
+# Guarantee the import-critical names always exist, even if definitions.json is
+# missing or corrupt. Without this, the dynamic globals().update() above would
+# leave `EFFECTS` / `EFFECTS_list` undefined and the static imports in light.py
+# and config_flow.py would raise ImportError, breaking the whole integration.
+if "EFFECTS" not in globals():
+    EFFECTS = Enum("EFFECTS", {"none": 0})
+    _effects_enums["EFFECTS"] = EFFECTS
+if "EFFECTS_list" not in globals():
+    EFFECTS_list = ["none"]
+    _effects_lists_data["EFFECTS_list"] = EFFECTS_list
 
 # Create EFFECTS_MAP with all dynamically loaded effect classes
 EFFECTS_MAP = _effects_enums.copy()

@@ -1,3 +1,7 @@
-bleak>=0.17.0
-bleak-retry-connector>=1.17.1
-bluepy>=1.3.0
+# Mirrors custom_components/elkbledom/manifest.json. These are provided by Home
+# Assistant's "bluetooth" integration at runtime; the floors are kept at or below
+# the versions current HA ships (HA 2026.5.x pins bleak==2.1.1,
+# bleak-retry-connector==4.6.0) so installing this integration never forces a
+# conflicting upgrade of HA's Bluetooth stack.
+bleak>=2.1.1
+bleak-retry-connector>=4.6.0

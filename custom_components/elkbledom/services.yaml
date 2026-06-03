@@ -75,3 +75,137 @@ set_rgb_color:
           min: 0
           max: 255
           mode: slider
+
+sync_time:
+  name: Sync Time
+  description: Synchronize the device's internal clock with Home Assistant's current time.
+  fields:
+    entity_id:
+      name: Entity
+      description: The light entity (device) to control
+      required: true
+      example: "light.led1"
+      selector:
+        entity:
+          domain: light
+          integration: elkbledom
+
+schedule_on:
+  name: Schedule On
+  description: Program the device's built-in daily timer to turn the strip on.
+  fields:
+    entity_id:
+      name: Entity
+      description: The light entity (device) to control
+      required: true
+      example: "light.led1"
+      selector:
+        entity:
+          domain: light
+          integration: elkbledom
+    hour:
+      name: Hour
+      description: Hour of day (0-23)
+      required: true
+      example: 7
+      selector:
+        number:
+          min: 0
+          max: 23
+          mode: box
+    minute:
+      name: Minute
+      description: Minute of hour (0-59)
+      required: true
+      example: 30
+      selector:
+        number:
+          min: 0
+          max: 59
+          mode: box
+    enabled:
+      name: Enabled
+      description: Whether this schedule is active.
+      required: false
+      default: true
+      selector:
+        boolean:
+    days:
+      name: Days
+      description: Days the schedule applies to.
+      required: false
+      default: ["all"]
+      selector:
+        select:
+          multiple: true
+          options:
+            - monday
+            - tuesday
+            - wednesday
+            - thursday
+            - friday
+            - saturday
+            - sunday
+            - all
+            - week_days
+            - weekend_days
+
+schedule_off:
+  name: Schedule Off
+  description: Program the device's built-in daily timer to turn the strip off.
+  fields:
+    entity_id:
+      name: Entity
+      description: The light entity (device) to control
+      required: true
+      example: "light.led1"
+      selector:
+        entity:
+          domain: light
+          integration: elkbledom
+    hour:
+      name: Hour
+      description: Hour of day (0-23)
+      required: true
+      example: 23
+      selector:
+        number:
+          min: 0
+          max: 23
+          mode: box
+    minute:
+      name: Minute
+      description: Minute of hour (0-59)
+      required: true
+      example: 0
+      selector:
+        number:
+          min: 0
+          max: 59
+          mode: box
+    enabled:
+      name: Enabled
+      description: Whether this schedule is active.
+      required: false
+      default: true
+      selector:
+        boolean:
+    days:
+      name: Days
+      description: Days the schedule applies to.
+      required: false
+      default: ["all"]
+      selector:
+        select:
+          multiple: true
+          options:
+            - monday
+            - tuesday
+            - wednesday
+            - thursday
+            - friday
+            - saturday
+            - sunday
+            - all
+            - week_days
+            - weekend_days

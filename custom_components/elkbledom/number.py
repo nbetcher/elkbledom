@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from homeassistant.components.number import (
     NumberEntity,
-    NumberEntityDescription,
 )
 
 from .elkbledom import BLEDOMInstance
@@ -74,12 +73,16 @@ class BLEDOMEffectSpeed(RestoreEntity, NumberEntity):
         )
 
     @property
-    def entity_info(self) -> None:
-        NumberEntityDescription(
-            key=self.name,
-            native_max_value=255,
-            native_min_value=0,
-        )
+    def native_min_value(self) -> int:
+        return 0
+
+    @property
+    def native_max_value(self) -> int:
+        return 255
+
+    @property
+    def native_step(self) -> int:
+        return 1
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""
@@ -107,6 +110,9 @@ class BLEDOMMicSensitivity(RestoreEntity, NumberEntity):
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_sensitivity"
         self._mic_sensitivity = 50
+        # Disabled by default unless the model opts into mic support, so
+        # unsupported strips don't show a non-functional control.
+        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
 
     @property
     def available(self):

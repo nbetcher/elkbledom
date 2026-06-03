@@ -34,6 +34,8 @@ class BLEDOMMicEffect(RestoreEntity, SelectEntity):
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_effect"
         self._current_option = MIC_EFFECTS_list[0]
+        # Disabled by default unless the model opts into mic support.
+        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
 
     @property
     def available(self):
@@ -165,4 +167,8 @@ class BLEDOMBrightnessModeSelect(RestoreEntity, SelectEntity):
                 LOG.debug(f"Restored brightness mode for {self.name}: {self._current_option}")
             else:
                 LOG.debug(f"Could not restore brightness mode for {self.name}, using default")
+
+        # Make sure the running instance actually reflects the selected mode.
+        # (Setup also seeds it from the config entry; this covers the restore path.)
+        await self._instance.apply_brightness_mode(self._current_option)
 

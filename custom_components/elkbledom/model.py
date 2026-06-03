@@ -14,6 +14,10 @@ MODELS_DATA_KEY = "elkbledom_models"
 # Cache for dynamically created effect enums
 _EFFECTS_CACHE = {}
 
+# Cache for definitions.json contents (read once, reused). Avoids repeated
+# blocking disk I/O on the event loop from effects lookups.
+_DEFINITIONS_CACHE: Optional[Dict] = None
+
 async def ensure_models_loaded(hass: HomeAssistant) -> Dict[str, Dict]:
     """Ensure models are loaded in hass.data, loading them if necessary."""
     if MODELS_DATA_KEY in hass.data:
@@ -220,16 +224,7 @@ class Model:
         
         # Fallback: return first match
         return matching_models[0][0]
-        
-        # No handle match: return the one without handle (generic version)
-        for model_name, model_data in matching_models:
-            if model_data.get("handle") is None:
-                LOGGER.debug("Model detected by name (no handle match): %s", model_name)
-                return model_name
-        
-        # Fallback: return first match
-        return matching_models[0][0]
-    
+
     def get_handle(self, internal_key: str) -> Optional[int]:
         """Get handle for model by internal key"""
         if internal_key in self._models:
@@ -247,7 +242,18 @@ class Model:
         if internal_key in self._models:
             return self._models[internal_key].get("read_uuid")
         return None
-    
+
+    def get_supports_mic(self, internal_key: str) -> bool:
+        """Whether the model is known to support the external microphone.
+
+        Models opt in via an optional "mic": true flag in models.json. When
+        absent (the default), the mic entities are still created but disabled in
+        the entity registry so they don't clutter unsupported devices.
+        """
+        if internal_key in self._models:
+            return bool(self._models[internal_key].get("mic", False))
+        return False
+
     def get_turn_on_cmd(self, internal_key: str) -> Optional[List[int]]:
         """Get turn on command for model by internal key"""
         if internal_key in self._models:
@@ -410,13 +416,18 @@ class Model:
         return definitions.get("effects_lists", {})
     
     def _load_definitions(self) -> Dict:
-        """Load definitions from definitions.json"""
+        """Load definitions from definitions.json (cached after first read)."""
+        global _DEFINITIONS_CACHE
+        if _DEFINITIONS_CACHE is not None:
+            return _DEFINITIONS_CACHE
         definitions_file = Path(__file__).parent / "definitions.json"
         try:
             if not definitions_file.exists():
-                return {}
+                _DEFINITIONS_CACHE = {}
+                return _DEFINITIONS_CACHE
             content = definitions_file.read_text(encoding="utf-8")
-            return json.loads(content)
+            _DEFINITIONS_CACHE = json.loads(content)
         except Exception as e:
             LOGGER.error("Error loading definitions.json: %s", e)
-            return {}
+            _DEFINITIONS_CACHE = {}
+        return _DEFINITIONS_CACHE

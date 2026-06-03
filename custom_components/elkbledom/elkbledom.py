@@ -25,6 +25,10 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_ATTEMPTS = 3
 #DISCONNECT_DELAY = 120
 BLEAK_BACKOFF_TIME = 0.25
+# Delay between the two login writes required by MELK/MODELX devices before
+# service discovery. Kept as a named constant so it can be tuned in one place;
+# only paid once per (re)connect for those device families.
+LOGIN_STEP_DELAY = 0.4
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
@@ -59,7 +63,8 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                 if attempt >= max_attempts:
                     LOGGER.debug("%s: %s error calling %s, reach max attempts (%s/%s): %s",self.name,type(err),func,attempt,max_attempts,err,exc_info=True,)
                     raise
-                LOGGER.debug("%s: %s error calling %s, retrying  (%s/%s)...: %s",self.name,type(err),func,attempt,max_attempts,err,exc_info=True,)
+                LOGGER.debug("%s: %s error calling %s, backing off %ss, retrying  (%s/%s)...: %s",self.name,type(err),func,BLEAK_BACKOFF_TIME,attempt,max_attempts,err,exc_info=True,)
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
@@ -113,7 +118,7 @@ class DeviceData():
         LOGGER.debug("Parsing Govee BLE advertisement data: %s", service_info)
 
 class BLEDOMInstance:
-    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None) -> None:
+    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None, brightness_mode: str = "auto") -> None:
         self.loop = asyncio.get_running_loop()
         self._address = address
         self._reset = reset
@@ -123,6 +128,11 @@ class BLEDOMInstance:
         self._device: BLEDevice | None = None
         self._device_data: DeviceData | None = None
         self._connect_lock: asyncio.Lock = asyncio.Lock()
+        # Serializes whole write operations (connect + write) for THIS device so
+        # concurrent commands can't interleave on the characteristic and the idle
+        # disconnect can't tear down the client mid-write. It is per-instance, so
+        # it never blocks commands to other devices.
+        self._operation_lock: asyncio.Lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._disconnect_timer: asyncio.TimerHandle | None = None
         self._cached_services: BleakGATTServiceCollection | None = None
@@ -143,9 +153,10 @@ class BLEDOMInstance:
         self._read_uuid = None
         self._write_uuid = None
         
-        # New: Brightness mode configuration
-        self._brightness_mode = "auto"  # auto, rgb, native
-        
+        # Brightness mode configuration (auto, rgb, native), seeded from config
+        mode = (brightness_mode or "auto").lower()
+        self._brightness_mode = mode if mode in ("auto", "rgb", "native") else "auto"
+
 
         try:
             self._device = async_ble_device_from_address(hass, self._address)
@@ -220,8 +231,12 @@ class BLEDOMInstance:
         """Send command to device and read response."""
         if not data:
             return
-        await self._ensure_connected()
-        await self._write_while_connected(data)
+        # Serialize the connect+write as one unit so overlapping commands to the
+        # same device can't interleave, and the idle-disconnect can't run between
+        # _ensure_connected() and the actual write (which would null out _client).
+        async with self._operation_lock:
+            await self._ensure_connected()
+            await self._write_while_connected(data)
 
     async def _write_while_connected(self, data: bytearray):
         LOGGER.debug(''.join(format(x, ' 03x') for x in data))
@@ -234,6 +249,18 @@ class BLEDOMInstance:
     @property
     def reset(self):
         return self._reset
+
+    @property
+    def delay(self):
+        return self._delay
+
+    @property
+    def forced_model(self):
+        return self._forced_model
+
+    @property
+    def brightness_mode(self):
+        return self._brightness_mode
 
     @property
     def name(self):
@@ -398,7 +425,11 @@ class BLEDOMInstance:
 
         async def write_native():
             """Use native brightness command then set base color."""
-            brightness_cmd = self._model.get_brightness_cmd(self._model_name, percent)
+            # Pass the raw 0-255 value: get_brightness_cmd() performs the
+            # 0-255 -> 0-100 conversion internally (identical to get_white_cmd).
+            # Passing the already-computed `percent` here double-scaled the value,
+            # capping the device at ~39% and collapsing low settings to 0.
+            brightness_cmd = self._model.get_brightness_cmd(self._model_name, self._brightness)
             await self._write(brightness_cmd)
             LOGGER.debug("%s: Brightness set via native command: %d%%", self.name, percent)
 
@@ -410,14 +441,24 @@ class BLEDOMInstance:
                 # Always use native brightness command
                 await write_native()
             else:  # auto
-                # Try native first, fallback to RGB on error
-                try:
-                    await write_native()
-                except Exception as e:
-                    LOGGER.warning("%s: Native brightness failed, fallback to RGB: %s", self.name, e)
+                # Prefer native, but fall back to RGB scaling when the model has
+                # no native brightness command (an empty command is a silent
+                # no-op, not an exception) or when the native write fails.
+                native_cmd = self._model.get_brightness_cmd(self._model_name, self._brightness)
+                has_rgb = bool(self._model.get_color_cmd(self._model_name, 255, 255, 255))
+                if native_cmd:
+                    try:
+                        await write_native()
+                    except Exception as e:
+                        LOGGER.warning("%s: Native brightness failed, fallback to RGB: %s", self.name, e)
+                        if has_rgb:
+                            await write_rgb_scaled()
+                elif has_rgb:
                     await write_rgb_scaled()
+                else:
+                    LOGGER.debug("%s: No native brightness or RGB command available; brightness not applied", self.name)
         except Exception as e:
-            LOGGER.error("%s: Error setting brightness: %s", self.name, e)  
+            LOGGER.error("%s: Error setting brightness: %s", self.name, e)
             
     @retry_bluetooth_connection_error
     async def set_effect_speed(self, value: int) -> None:
@@ -529,7 +570,8 @@ class BLEDOMInstance:
     @retry_bluetooth_connection_error
     async def update(self) -> None:
         try:
-            await self._ensure_connected()
+            async with self._operation_lock:
+                await self._ensure_connected()
 
             # Query device state
             # if self._read_uuid and self._client and self._client.is_connected:
@@ -545,7 +587,8 @@ class BLEDOMInstance:
                 self._color_temp_kelvin = 5000
                 self._brightness = 255
 
-            self._device_data.update_device()
+            if self._device_data is not None:
+                self._device_data.update_device()
             #future = asyncio.get_event_loop().create_future()
             #await self._device.start_notify(self._read_uuid, create_status_callback(future))
             #await self._write([0x7e, 0x00, 0x01, 0xfa, 0x00, 0x00, 0x00, 0x00, 0xef])
@@ -628,9 +671,9 @@ class BLEDOMInstance:
                     if temp_write_uuid:
                         LOGGER.info("%s: Executing login sequence...", self.name)
                         await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x07, 0x83]), response=False)
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(LOGIN_STEP_DELAY)
                         await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x04, 0x04]), response=False)
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(LOGIN_STEP_DELAY)
                         LOGGER.info("%s: Login sequence completed", self.name)
                     else:
                         LOGGER.warning("%s: Could not find write UUID for login procedure", self.name)
@@ -820,7 +863,9 @@ class BLEDOMInstance:
         await self._execute_disconnect()
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
-        async with self._connect_lock:
+        # Use the operation lock (not just the connect lock) so a disconnect can
+        # never run between _ensure_connected() and the write inside _write().
+        async with self._operation_lock:
             read_char = self._read_uuid if hasattr(self, '_read_uuid') else None
             client = self._client
             LOGGER.debug("Disconnecting: READ_UUID=%s, CLIENT_CONNECTED=%s", read_char, client.is_connected if client else "No Client")

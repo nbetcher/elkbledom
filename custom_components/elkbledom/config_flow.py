@@ -7,7 +7,6 @@ from typing import Any
 from homeassistant import config_entries
 from homeassistant.const import CONF_MAC
 import voluptuous as vol
-from homeassistant.helpers.device_registry import format_mac
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.core import callback
 from homeassistant.components.bluetooth import (
@@ -15,7 +14,7 @@ from homeassistant.components.bluetooth import (
     async_discovered_service_info,
 )
 
-from .const import DOMAIN, CONF_RESET, CONF_DELAY, CONF_MODEL, CONF_EFFECTS_CLASS, EFFECTS_MAP
+from .const import DOMAIN, CONF_RESET, CONF_DELAY, CONF_MODEL, CONF_EFFECTS_CLASS, EFFECTS_MAP, DEFAULT_RESET, DEFAULT_DELAY
 import logging
 
 LOGGER = logging.getLogger(__name__)
@@ -198,7 +197,9 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             self._model_name = user_input.get(CONF_MODEL)
             self._effects_class = user_input.get(CONF_EFFECTS_CLASS)
             LOGGER.debug("Manual setup - MAC: %s, Name: %s, Model: %s, Effects: %s", self.mac, self.name, self._model_name, self._effects_class)
-            await self.async_set_unique_id(format_mac(self.mac))
+            # Use the raw address (same normalization as the discovery/user paths
+            # and HA's Bluetooth convention) so the same device can't be added twice.
+            await self.async_set_unique_id(self.mac)
             return await self.async_step_validate()
 
         # Ensure models are loaded
@@ -252,13 +253,10 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(entry: config_entries.ConfigEntry):
-        return OptionsFlowHandler(entry)
+        return OptionsFlowHandler()
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-
-    def __init__(self, config_entry):
-        """Initialize options flow."""
-        #self.config_entry = config_entry
+    # `self.config_entry` is provided by the OptionsFlow base class in modern HA.
 
     async def async_step_init(self, _user_input=None):
         """Manage the options."""
@@ -267,14 +265,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_user(self, user_input=None):
         """Handle a flow initialized by the user."""
         errors = {}
-        options = self.config_entry.options or {CONF_RESET: False, CONF_DELAY: 120}
+        options = self.config_entry.options or {CONF_RESET: DEFAULT_RESET, CONF_DELAY: DEFAULT_DELAY}
         current_model = self.config_entry.options.get(CONF_MODEL) or self.config_entry.data.get(CONF_MODEL)
         
         if user_input is not None:
-            new_options = {
-                CONF_RESET: user_input[CONF_RESET],
-                CONF_DELAY: user_input[CONF_DELAY]
-            }
+            # Start from existing options so settings not shown in this form
+            # (e.g. brightness_mode, managed by the Brightness Mode select entity)
+            # are preserved instead of being wiped on save.
+            new_options = dict(self.config_entry.options)
+            new_options[CONF_RESET] = user_input[CONF_RESET]
+            new_options[CONF_DELAY] = user_input[CONF_DELAY]
             if CONF_MODEL in user_input:
                 # Value is already internal_key from vol.In
                 new_options[CONF_MODEL] = user_input[CONF_MODEL]
