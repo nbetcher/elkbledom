@@ -118,13 +118,16 @@ class DeviceData():
         LOGGER.debug("Parsing Govee BLE advertisement data: %s", service_info)
 
 class BLEDOMInstance:
-    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None, brightness_mode: str = "auto") -> None:
+    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None, brightness_mode: str = "auto", config_name: str = None) -> None:
         self.loop = asyncio.get_running_loop()
         self._address = address
         self._reset = reset
         self._delay = delay
         self._hass = hass
         self._forced_model = forced_model
+        # User-given name from the config entry; used as the single source for
+        # every entity's DeviceInfo name so the device is labeled consistently.
+        self._config_name = config_name
         self._device: BLEDevice | None = None
         self._device_data: DeviceData | None = None
         self._connect_lock: asyncio.Lock = asyncio.Lock()
@@ -257,6 +260,15 @@ class BLEDOMInstance:
     @property
     def forced_model(self):
         return self._forced_model
+
+    @property
+    def config_name(self):
+        """User-given device name from the config entry.
+
+        Falls back to the BLE advertised name if not provided (e.g. the
+        transient instance the config flow builds during validation).
+        """
+        return self._config_name or self.name
 
     @property
     def brightness_mode(self):

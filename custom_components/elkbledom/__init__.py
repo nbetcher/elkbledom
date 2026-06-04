@@ -114,7 +114,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Ensure models are loaded (will reuse if already in hass.data)
     await ensure_models_loaded(hass)
 
-    instance = BLEDOMInstance(entry.data[CONF_MAC], reset, delay, hass, forced_model, brightness_mode)
+    instance = BLEDOMInstance(entry.data[CONF_MAC], reset, delay, hass, forced_model, brightness_mode, entry.data.get("name"))
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = instance
    
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

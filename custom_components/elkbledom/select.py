@@ -65,7 +65,7 @@ class BLEDOMMicEffect(RestoreEntity, SelectEntity):
             identifiers={
                 (DOMAIN, self._instance.address)
             },
-            name=self.name,
+            name=self._instance.config_name,
             connections={(device_registry.CONNECTION_NETWORK_MAC,
                           self._instance.address)},
         )
@@ -129,7 +129,7 @@ class BLEDOMBrightnessModeSelect(RestoreEntity, SelectEntity):
             identifiers={
                 (DOMAIN, self._instance.address)
             },
-            name=self.name,
+            name=self._instance.config_name,
             connections={(device_registry.CONNECTION_NETWORK_MAC,
                           self._instance.address)},
         )

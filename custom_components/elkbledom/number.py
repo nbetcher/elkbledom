@@ -67,7 +67,7 @@ class BLEDOMEffectSpeed(RestoreEntity, NumberEntity):
                 # Serial numbers are unique identifiers within a specific domain
                 (DOMAIN, self._instance.address)
             },
-            name=self.name,
+            name=self._instance.config_name,
             connections={(device_registry.CONNECTION_NETWORK_MAC,
                           self._instance.address)},
         )
@@ -150,7 +150,7 @@ class BLEDOMMicSensitivity(RestoreEntity, NumberEntity):
             identifiers={
                 (DOMAIN, self._instance.address)
             },
-            name=self.name,
+            name=self._instance.config_name,
             connections={(device_registry.CONNECTION_NETWORK_MAC,
                           self._instance.address)},
         )

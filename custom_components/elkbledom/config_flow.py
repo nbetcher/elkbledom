@@ -168,8 +168,12 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                         LOGGER.debug("Saving effects_class to entry_data: %s", self._effects_class)
                     LOGGER.debug("Creating entry with data: %s", entry_data)
                     return self.async_create_entry(title=self.name, data=entry_data)
-                return self.async_abort(reason="cannot_validate")
-            
+                # Light didn't blink -- or the box was left unchecked by accident.
+                # Re-run validation (re-toggle and ask again) instead of hard
+                # aborting, so a single misclick doesn't drop the discovered device.
+                LOGGER.debug("Flicker not confirmed; re-running validation toggle")
+                return await self.async_step_validate()
+
             if "retry" in user_input and not user_input["retry"]:
                 return self.async_abort(reason="cannot_connect")
 
