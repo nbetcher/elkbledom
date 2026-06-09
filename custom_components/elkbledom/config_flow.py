@@ -204,6 +204,9 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             # Use the raw address (same normalization as the discovery/user paths
             # and HA's Bluetooth convention) so the same device can't be added twice.
             await self.async_set_unique_id(self.mac)
+            # Abort if this device is already configured (the discovery/user path
+            # does this too); without it a manual add creates a duplicate entry.
+            self._abort_if_unique_id_configured()
             return await self.async_step_validate()
 
         # Ensure models are loaded

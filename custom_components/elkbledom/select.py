@@ -4,11 +4,10 @@ from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers import device_registry
 
 from .elkbledom import BLEDOMInstance
+from .entity import BLEDOMEntity
 from .const import DOMAIN, MIC_EFFECTS, MIC_EFFECTS_list, BRIGHTNESS_MODES, CONF_BRIGHTNESS_MODE
 
 import logging
@@ -26,7 +25,7 @@ async def async_setup_entry(
         BLEDOMBrightnessModeSelect(instance, "Brightness Mode " + config_entry.data["name"], config_entry, config_entry.entry_id)
     ])
 
-class BLEDOMMicEffect(RestoreEntity, SelectEntity):
+class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
     """Microphone Effect selector entity"""
 
     def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
@@ -38,37 +37,12 @@ class BLEDOMMicEffect(RestoreEntity, SelectEntity):
         self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
 
     @property
-    def available(self):
-        return self._instance.is_on != None
-
-    @property
-    def name(self) -> str:
-        return self._attr_name
-
-    @property
-    def unique_id(self) -> str:
-        """Return the unique id."""
-        return self._attr_unique_id
-
-    @property
     def current_option(self) -> str | None:
         return self._current_option
 
     @property
     def options(self) -> list[str]:
         return MIC_EFFECTS_list
-
-    @property
-    def device_info(self):
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={
-                (DOMAIN, self._instance.address)
-            },
-            name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC,
-                          self._instance.address)},
-        )
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
@@ -91,7 +65,7 @@ class BLEDOMMicEffect(RestoreEntity, SelectEntity):
                 LOG.debug(f"Could not restore mic effect for {self.name}, using default")
 
 
-class BLEDOMBrightnessModeSelect(RestoreEntity, SelectEntity):
+class BLEDOMBrightnessModeSelect(BLEDOMEntity, RestoreEntity, SelectEntity):
     """Brightness Mode selector entity"""
 
     def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry: ConfigEntry, entry_id: str) -> None:
@@ -102,37 +76,12 @@ class BLEDOMBrightnessModeSelect(RestoreEntity, SelectEntity):
         self._current_option = entry.options.get(CONF_BRIGHTNESS_MODE, "auto")
 
     @property
-    def available(self):
-        return self._instance.is_on != None
-
-    @property
-    def name(self) -> str:
-        return self._attr_name
-
-    @property
-    def unique_id(self) -> str:
-        """Return the unique id."""
-        return self._attr_unique_id
-
-    @property
     def current_option(self) -> str | None:
         return self._current_option
 
     @property
     def options(self) -> list[str]:
         return BRIGHTNESS_MODES
-
-    @property
-    def device_info(self):
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={
-                (DOMAIN, self._instance.address)
-            },
-            name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC,
-                          self._instance.address)},
-        )
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected brightness mode."""

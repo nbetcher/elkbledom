@@ -6,11 +6,10 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers import device_registry
 
 from .elkbledom import BLEDOMInstance
+from .entity import BLEDOMEntity
 from .const import DOMAIN
 
 import logging
@@ -27,7 +26,7 @@ async def async_setup_entry(
         BLEDOMMicSwitch(instance, "Mic Enable " + config_entry.data["name"], config_entry.entry_id)
     ])
 
-class BLEDOMMicSwitch(RestoreEntity, SwitchEntity):
+class BLEDOMMicSwitch(BLEDOMEntity, RestoreEntity, SwitchEntity):
     """Microphone Enable/Disable switch entity"""
 
     def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
@@ -39,33 +38,8 @@ class BLEDOMMicSwitch(RestoreEntity, SwitchEntity):
         self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
 
     @property
-    def available(self):
-        return self._instance.is_on != None
-
-    @property
-    def name(self) -> str:
-        return self._attr_name
-
-    @property
-    def unique_id(self) -> str:
-        """Return the unique id."""
-        return self._attr_unique_id
-
-    @property
     def is_on(self) -> bool:
         return self._is_on
-
-    @property
-    def device_info(self):
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={
-                (DOMAIN, self._instance.address)
-            },
-            name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC,
-                          self._instance.address)},
-        )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the microphone on."""

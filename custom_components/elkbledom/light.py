@@ -5,11 +5,11 @@ import voluptuous as vol
 from typing import Any, Optional, Tuple
 
 from .elkbledom import BLEDOMInstance
+from .entity import BLEDOMEntity
 from .const import DOMAIN, EFFECTS, EFFECTS_list, EFFECTS_MAP, EFFECTS_LIST_MAP, CONF_EFFECTS_CLASS
 
 from homeassistant.const import CONF_MAC, CONF_COLOR_TEMP
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.components.light import (
     PLATFORM_SCHEMA,
@@ -23,7 +23,6 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.util.color import (match_max_scale, color_temperature_mired_to_kelvin)
-from homeassistant.helpers import device_registry
 
 PARALLEL_UPDATES = 0  # fix entity_platform parallel_updates Semaphore
 
@@ -36,7 +35,7 @@ async def async_setup_entry(hass, config_entry, async_add_devices) -> None:
     instance = hass.data[DOMAIN][config_entry.entry_id]
     async_add_devices([BLEDOMLight(instance, config_entry.data["name"], config_entry.entry_id)])
 
-class BLEDOMLight(RestoreEntity, LightEntity):
+class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
     def __init__(self, bledomInstance: BLEDOMInstance, name: str, entry_id: str) -> None:
         self._instance = bledomInstance
         self._entry_id = entry_id
@@ -62,10 +61,6 @@ class BLEDOMLight(RestoreEntity, LightEntity):
         self._attr_effect = None
         self._attr_unique_id = self._instance.address
         self._hass = None
-
-    @property
-    def available(self):
-        return self._instance.is_on != None
 
     @property
     def brightness(self):
@@ -122,18 +117,6 @@ class BLEDOMLight(RestoreEntity, LightEntity):
         return None
 
     @property
-    def device_info(self):
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self._instance.address)
-            },
-            name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC, self._instance.address)},
-        )
-
-    @property
     def should_poll(self) -> bool:
         """No polling needed for a demo light."""
         return False
@@ -179,15 +162,22 @@ class BLEDOMLight(RestoreEntity, LightEntity):
                 self._instance._is_on = False
                 LOGGER.debug(f"Previous state was unavailable, setting to OFF")
             
-            # Restore brightness
-            if ATTR_BRIGHTNESS in last_state.attributes:
-                self._instance._brightness = last_state.attributes[ATTR_BRIGHTNESS]
+            # Restore brightness (guard against a saved None, which would
+            # overwrite the 255 default and leak None into reported state)
+            restored_brightness = last_state.attributes.get(ATTR_BRIGHTNESS)
+            if restored_brightness is not None:
+                self._instance._brightness = restored_brightness
                 LOGGER.debug(f"Restored brightness: {self._instance._brightness}")
             
             # Restore RGB color
             if ATTR_RGB_COLOR in last_state.attributes and last_state.attributes[ATTR_RGB_COLOR] is not None:
                 try:
                     self._instance._rgb_color = tuple(last_state.attributes[ATTR_RGB_COLOR])
+                    # Also restore the unscaled base color (HA's rgb_color is the
+                    # full-scale color); without this the first brightness change
+                    # after a restart scales the default white base and the
+                    # restored color is lost (strip goes white).
+                    self._instance._rgb_color_base = self._instance._rgb_color
                     if ColorMode.RGB in self._attr_supported_color_modes:
                         self._attr_color_mode = ColorMode.RGB
                         LOGGER.debug(f"Restored RGB color: {self._instance._rgb_color}")
@@ -263,8 +253,7 @@ class BLEDOMLight(RestoreEntity, LightEntity):
                 LOGGER.debug("Change color to white to reset led strip when other infrared control interact")
                 self._attr_effect = None
                 await self._instance.set_color(self._transform_color_brightness((255, 255, 255), 250), is_base_color=False)
-                if ATTR_WHITE in kwargs:
-                    await self._instance.set_white(kwargs[ATTR_WHITE])
+                # ATTR_WHITE (if present) is applied by the White block below.
 
         
         # Normalize legacy color_temp (mireds) sent by some cards/automations
@@ -302,19 +291,23 @@ class BLEDOMLight(RestoreEntity, LightEntity):
             await self._instance.set_white(kwargs[ATTR_WHITE])
             brightness_handled = True
 
-        # --- RGB color: write the new base color, then brightness exactly once ---
+        # --- RGB color: write the color, then brightness exactly once ---
         if ATTR_RGB_COLOR in kwargs:
             self._attr_color_mode = ColorMode.RGB
-            color = kwargs[ATTR_RGB_COLOR]
+            color = tuple(kwargs[ATTR_RGB_COLOR])
             self._attr_effect = None
-            await self._instance.set_color(color, is_base_color=True)
             target_brightness = brightness if brightness is not None else self.brightness
-            if target_brightness is not None and target_brightness < 255:
-                # Dim the freshly-set base color.
+            # Always write the color: cached state is not a reliable proxy for
+            # what the strip physically shows (mode switches, running effects,
+            # IR-remote changes), so an explicit rgb_color request is always sent.
+            await self._instance.set_color(color, is_base_color=True)
+            if target_brightness is not None and (
+                target_brightness < 255 or target_brightness != self.brightness
+            ):
+                # Re-dim the full-scale color just written (RGB-scaling models),
+                # or push a changed brightness -- including a change *to* 255,
+                # which resets a previously-dimmed native brightness register.
                 await self._instance.set_brightness(target_brightness)
-            else:
-                # Color already written at full scale; sync state without an extra write.
-                self._instance._brightness = 255
             brightness_handled = True
 
         # --- Brightness only (no color/temp/white attribute in this call) ---

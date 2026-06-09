@@ -5,12 +5,11 @@ from homeassistant.components.number import (
 )
 
 from .elkbledom import BLEDOMInstance
+from .entity import BLEDOMEntity
 from .const import DOMAIN
 
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers import device_registry
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 
@@ -30,7 +29,7 @@ async def async_setup_entry(
         entities.append(BLEDOMEffectSpeed(instance, "Effect Speed " + config_entry.data["name"], config_entry.entry_id))
     async_add_entities(entities)
 
-class BLEDOMEffectSpeed(RestoreEntity, NumberEntity):
+class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
     """Effect Speed entity"""
 
     def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
@@ -40,37 +39,11 @@ class BLEDOMEffectSpeed(RestoreEntity, NumberEntity):
         self._effect_speed = 0
 
     @property
-    def available(self):
-        return self._instance.is_on != None
-
-    @property
-    def name(self) -> str:
-        return self._attr_name
-
-    @property
-    def unique_id(self) -> str:
-        """Return the unique id."""
-        return self._attr_unique_id
-
-    @property
     def native_value(self) -> int | None:
         # Sync with instance value
         if self._instance.effect_speed is not None:
             return self._instance.effect_speed
         return self._effect_speed
-
-    @property
-    def device_info(self):
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self._instance.address)
-            },
-            name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC,
-                          self._instance.address)},
-        )
 
     @property
     def native_min_value(self) -> int:
@@ -102,7 +75,7 @@ class BLEDOMEffectSpeed(RestoreEntity, NumberEntity):
             except (ValueError, TypeError):
                 LOG.debug(f"Could not restore effect speed for {self.name}, using default")
 
-class BLEDOMMicSensitivity(RestoreEntity, NumberEntity):
+class BLEDOMMicSensitivity(BLEDOMEntity, RestoreEntity, NumberEntity):
     """Microphone Sensitivity entity"""
 
     def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
@@ -113,19 +86,6 @@ class BLEDOMMicSensitivity(RestoreEntity, NumberEntity):
         # Disabled by default unless the model opts into mic support, so
         # unsupported strips don't show a non-functional control.
         self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
-
-    @property
-    def available(self):
-        return self._instance.is_on != None
-
-    @property
-    def name(self) -> str:
-        return self._attr_name
-
-    @property
-    def unique_id(self) -> str:
-        """Return the unique id."""
-        return self._attr_unique_id
 
     @property
     def native_value(self) -> int | None:
@@ -142,18 +102,6 @@ class BLEDOMMicSensitivity(RestoreEntity, NumberEntity):
     @property
     def native_step(self) -> int:
         return 1
-
-    @property
-    def device_info(self):
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={
-                (DOMAIN, self._instance.address)
-            },
-            name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC,
-                          self._instance.address)},
-        )
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""

@@ -266,12 +266,28 @@ class Model:
             return self._models[internal_key].get("commands", {}).get("turn_off")
         return None
     
+    @staticmethod
+    def _scale_intensity(intensity: int) -> int:
+        """Convert a 0-255 intensity to the device's 0-100 'i' value.
+
+        A non-zero input is floored to 1 so the lowest brightness still dims the
+        strip instead of mapping to 0 (off); an input of 0 stays 0 so turning the
+        white channel fully off is preserved. Shared by get_white_cmd and
+        get_brightness_cmd so the conversion can't drift between the two.
+        """
+        intensity = int(intensity)
+        value = int(intensity * 100 / 255)
+        if value == 0 and intensity > 0:
+            value = 1
+        return value
+
     def get_white_cmd(self, internal_key: str, intensity: int) -> Optional[List[int]]:
         """Get white command for model with intensity by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("white", []).copy()
-            # Replace 'i' placeholder with intensity value
-            cmd = [int(intensity * 100 / 255) if x == "i" else x for x in cmd]
+            # Replace 'i' placeholder with the scaled intensity value
+            scaled = self._scale_intensity(intensity)
+            cmd = [scaled if x == "i" else x for x in cmd]
             return cmd
         return None
     
@@ -331,8 +347,9 @@ class Model:
         """Get brightness command for model by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("brightness", []).copy()
-            # Replace 'i' placeholder with intensity value
-            cmd = [int(intensity * 100 / 255) if x == "i" else x for x in cmd]
+            # Replace 'i' placeholder with the scaled intensity value
+            scaled = self._scale_intensity(intensity)
+            cmd = [scaled if x == "i" else x for x in cmd]
             return cmd
         return None
     

@@ -138,6 +138,9 @@ class BLEDOMInstance:
         self._operation_lock: asyncio.Lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._disconnect_timer: asyncio.TimerHandle | None = None
+        # Strong reference to the in-flight idle-disconnect task (asyncio only
+        # keeps a weak ref, so without this it can be GC'd mid-await).
+        self._disconnect_task: asyncio.Task | None = None
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
         self._is_on = None
@@ -245,6 +248,19 @@ class BLEDOMInstance:
         LOGGER.debug(''.join(format(x, ' 03x') for x in data))
         await self._client.write_gatt_char(self._write_uuid, data, False)
 
+    async def _write_many(self, *data_items) -> None:
+        """Send several commands under a single lock acquisition so a paired
+        sequence (e.g. color-temp + white) lands atomically and can't be
+        interleaved by a competing command on the same device. Falsy items
+        (empty/None commands) are skipped."""
+        items = [d for d in data_items if d]
+        if not items:
+            return
+        async with self._operation_lock:
+            await self._ensure_connected()
+            for data in items:
+                await self._write_while_connected(data)
+
     @property
     def address(self):
         return self._address
@@ -349,7 +365,6 @@ class BLEDOMInstance:
     async def set_color_temp_kelvin(self, value: int, brightness: int) -> None:
         # White colours are represented by colour temperature percentage from 0x0 to 0x64 from warm to cool
         # Warm (0x0) is only the warm white LED, cool (0x64) is only the white LED and then a mixture between the two
-        self._color_temp_kelvin = value
         min_temp = self._model.get_min_color_temp_kelvin(self._model_name)
         max_temp = self._model.get_max_color_temp_kelvin(self._model_name)
         if value < min_temp:
@@ -360,24 +375,29 @@ class BLEDOMInstance:
         # Ensure brightness is not None before using it
         if brightness is None:
             brightness = self._brightness if self._brightness is not None else 255
-        self._brightness = brightness
 
         # Clamp t to [0, 1]: 0 = warmest (min_temp), 1 = coolest (max_temp)
         t = (value - min_temp) / (max_temp - min_temp) if max_temp > min_temp else 1.0
 
-        # Prefer native color_temp command if the model supports it
-        native_ct_cmd = self._model.get_color_temp_cmd(self._model_name, 50, 50)
-        if native_ct_cmd:
-            # Convert kelvin → warm/cold percentages (0-100)
-            # warm=100/cold=0 at min_temp (warmest), warm=0/cold=100 at max_temp (coolest)
-            warm_pct = int((1.0 - t) * 100)
-            cold_pct = int(t * 100)
-            cmd = self._model.get_color_temp_cmd(self._model_name, warm_pct, cold_pct)
-            await self._write(cmd)
-            # Set brightness via white channel if model supports it
+        # Convert kelvin → warm/cold percentages (0-100):
+        # warm=100/cold=0 at min_temp (warmest), warm=0/cold=100 at max_temp (coolest)
+        warm_pct = int((1.0 - t) * 100)
+        cold_pct = int(t * 100)
+        # Built once; doubles as the capability probe (empty → RGB fallback below).
+        cmd = self._model.get_color_temp_cmd(self._model_name, warm_pct, cold_pct)
+        if cmd:
+            # Set brightness via white channel if model supports it. Send both as
+            # one atomic operation so the pair can't be interleaved by another
+            # command on the same device (an empty white_cmd is skipped).
             white_cmd = self._model.get_white_cmd(self._model_name, brightness)
+            await self._write_many(cmd, white_cmd)
+            # Cache only after the write succeeds, and brightness only if it was
+            # actually transmitted (no white command -> nothing applied it).
+            self._color_temp_kelvin = value
             if white_cmd:
-                await self._write(white_cmd)
+                self._brightness = brightness
+            else:
+                LOGGER.debug("%s: Model has no white command; brightness not sent with color temp", self.name)
             return
 
         # Fallback: RGB emulation for models without native color_temp command
@@ -388,21 +408,28 @@ class BLEDOMInstance:
         g = int(warm[1] + (cool[1] - warm[1]) * t)
         b = int(warm[2] + (cool[2] - warm[2]) * t)
 
-        # Save the unscaled color as base color for future brightness adjustments
-        self._rgb_color_base = (r, g, b)
-
         # Apply brightness scaling
         scale = brightness / 255.0
         r_scaled, g_scaled, b_scaled = int(r * scale), int(g * scale), int(b * scale)
 
-        # Send scaled color but mark base color was already saved above
-        await self.set_color((r_scaled, g_scaled, b_scaled), is_base_color=False)
-        # Note: _rgb_color is set in set_color, but _rgb_color_base is preserved
+        # Write directly (not via the @retry-decorated set_color) so this method's
+        # own @retry doesn't nest with set_color's; cache only after success.
+        color_cmd = self._model.get_color_cmd(self._model_name, r_scaled, g_scaled, b_scaled)
+        await self._write(color_cmd)
+        self._rgb_color = (r_scaled, g_scaled, b_scaled)
+        self._rgb_color_base = (r, g, b)  # unscaled base for future brightness changes
+        self._color_temp_kelvin = value
+        self._brightness = brightness
 
     @retry_bluetooth_connection_error
     async def set_color(self, rgb: Tuple[int, int, int], is_base_color: bool = False) -> None:
         r, g, b = rgb
         color_cmd = self._model.get_color_cmd(self._model_name, r, g, b)
+        if not color_cmd:
+            # White/temp-only models have no color command; don't pollute the
+            # cached RGB state with a write that never happened.
+            LOGGER.debug("%s: Model has no color command; ignoring set_color(%s)", self.name, rgb)
+            return
         await self._write(color_cmd)
         self._rgb_color = rgb
         # If this is a base color (not brightness-scaled), save it
@@ -420,57 +447,67 @@ class BLEDOMInstance:
     @retry_bluetooth_connection_error
     async def set_brightness(self, intensity: int) -> None:
         """Set brightness with configurable mode (auto/rgb/native)."""
-        self._brightness = max(1, min(int(intensity), 255))
-        percent = round(self._brightness * 100 / 255)
+        value = max(1, min(int(intensity), 255))
+        percent = round(value * 100 / 255)  # logging only; commands scale internally
         mode = (self._brightness_mode or "auto").lower()
-        
-        # ALWAYS use base RGB color (not already-scaled color) to avoid cumulative scaling
+
+        # ALWAYS scale from the base RGB color (not the already-scaled color) to
+        # avoid cumulative scaling.
         r, g, b = self._rgb_color_base
-        
+        # Built once: the native-mode payload and the auto-mode capability probe.
+        # get_brightness_cmd converts 0-255 -> 0-100 internally (same as
+        # get_white_cmd); passing an already-converted percent double-scales.
+        native_cmd = self._model.get_brightness_cmd(self._model_name, value)
+        has_rgb = bool(self._model.get_color_cmd(self._model_name, 255, 255, 255))
+
         async def write_rgb_scaled():
-            """Scale RGB values by brightness from base color."""
-            scale = self._brightness / 255.0
+            """Scale RGB from the base color and write it directly (not via the
+            @retry-decorated set_color) to avoid nested retry amplification."""
+            scale = value / 255.0
             rr, gg, bb = int(r * scale), int(g * scale), int(b * scale)
-            # Don't save as base color, this is scaled
-            await self.set_color((rr, gg, bb), is_base_color=False)
+            color_cmd = self._model.get_color_cmd(self._model_name, rr, gg, bb)
+            await self._write(color_cmd)
+            self._rgb_color = (rr, gg, bb)  # scaled; the base color is preserved
             LOGGER.debug("%s: Brightness set via RGB scaling: %d%% (Base RGB: %d,%d,%d -> Scaled: %d,%d,%d)", self.name, percent, r, g, b, rr, gg, bb)
 
         async def write_native():
-            """Use native brightness command then set base color."""
-            # Pass the raw 0-255 value: get_brightness_cmd() performs the
-            # 0-255 -> 0-100 conversion internally (identical to get_white_cmd).
-            # Passing the already-computed `percent` here double-scaled the value,
-            # capping the device at ~39% and collapsing low settings to 0.
-            brightness_cmd = self._model.get_brightness_cmd(self._model_name, self._brightness)
-            await self._write(brightness_cmd)
+            """Send the model's native brightness command."""
+            await self._write(native_cmd)
             LOGGER.debug("%s: Brightness set via native command: %d%%", self.name, percent)
 
-        try:
-            if mode == "rgb":
-                # Always use RGB scaling
-                await write_rgb_scaled()
-            elif mode == "native":
-                # Always use native brightness command
-                await write_native()
-            else:  # auto
-                # Prefer native, but fall back to RGB scaling when the model has
-                # no native brightness command (an empty command is a silent
-                # no-op, not an exception) or when the native write fails.
-                native_cmd = self._model.get_brightness_cmd(self._model_name, self._brightness)
-                has_rgb = bool(self._model.get_color_cmd(self._model_name, 255, 255, 255))
-                if native_cmd:
-                    try:
-                        await write_native()
-                    except Exception as e:
-                        LOGGER.warning("%s: Native brightness failed, fallback to RGB: %s", self.name, e)
-                        if has_rgb:
-                            await write_rgb_scaled()
-                elif has_rgb:
+        # NOTE: exceptions are intentionally NOT swallowed here -- they propagate
+        # to @retry_bluetooth_connection_error so a transient BLE failure is
+        # retried instead of being logged and falsely reported to HA as success.
+        if mode == "rgb":
+            if not has_rgb:
+                LOGGER.debug("%s: No RGB color command available; brightness not applied", self.name)
+                return
+            await write_rgb_scaled()
+        elif mode == "native":
+            if not native_cmd:
+                LOGGER.debug("%s: No native brightness command available; brightness not applied", self.name)
+                return
+            await write_native()
+        else:  # auto
+            # Prefer native, but fall back to RGB scaling when the model has no
+            # native brightness command (an empty command is a silent no-op, not
+            # an exception) or when the native write fails.
+            if native_cmd:
+                try:
+                    await write_native()
+                except Exception as e:
+                    if not has_rgb:
+                        raise
+                    LOGGER.warning("%s: Native brightness failed, fallback to RGB: %s", self.name, e)
                     await write_rgb_scaled()
-                else:
-                    LOGGER.debug("%s: No native brightness or RGB command available; brightness not applied", self.name)
-        except Exception as e:
-            LOGGER.error("%s: Error setting brightness: %s", self.name, e)
+            elif has_rgb:
+                await write_rgb_scaled()
+            else:
+                LOGGER.debug("%s: No native brightness or RGB command available; brightness not applied", self.name)
+                return
+        # Cache only after a successful write so a failed command never leaves
+        # the reported brightness ahead of the device.
+        self._brightness = value
             
     @retry_bluetooth_connection_error
     async def set_effect_speed(self, value: int) -> None:
@@ -574,7 +611,9 @@ class BLEDOMInstance:
         if query_cmd:
             try:
                 LOGGER.debug("%s: Querying state with model command", self.name)
-                await self._write_while_connected(query_cmd)
+                # Route through _write so the operation lock is held (matches every
+                # other command); _write_while_connected would bypass it.
+                await self._write(query_cmd)
                 await asyncio.sleep(0.2)
             except Exception as e:
                 LOGGER.debug("%s: Query command failed: %s", self.name, e)
@@ -582,6 +621,16 @@ class BLEDOMInstance:
     @retry_bluetooth_connection_error
     async def update(self) -> None:
         try:
+            # PROBLEMS WITH STATUS VALUE, I HAVE NOT VALUE TO WRITE AND GET STATUS
+            # Seed unknown state BEFORE attempting to connect so a failed first
+            # connect (re-raised below and retried) still leaves the entity
+            # available and reporting OFF rather than permanently unavailable.
+            if(self._is_on is None):
+                self._is_on = False
+                self._rgb_color = (0, 0, 0)
+                self._color_temp_kelvin = 5000
+                self._brightness = 255
+
             async with self._operation_lock:
                 await self._ensure_connected()
 
@@ -591,13 +640,6 @@ class BLEDOMInstance:
             #         await self.query_state()
             #     except Exception as e:
             #         LOGGER.debug("%s: Could not query state: %s", self.name, e)
-
-            # PROBLEMS WITH STATUS VALUE, I HAVE NOT VALUE TO WRITE AND GET STATUS
-            if(self._is_on is None):
-                self._is_on = False
-                self._rgb_color = (0, 0, 0)
-                self._color_temp_kelvin = 5000
-                self._brightness = 255
 
             if self._device_data is not None:
                 self._device_data.update_device()
@@ -617,6 +659,10 @@ class BLEDOMInstance:
             # self._brightness = res[9] if res[9] > 0 else None
             # LOGGER.debug(''.join(format(x, ' 03x') for x in res))
             
+        except BLEAK_EXCEPTIONS:
+            # Transient BLE error: re-raise so @retry_bluetooth_connection_error
+            # retries it instead of silently flipping the reported state to OFF.
+            raise
         except (Exception) as error:
             self._is_on = False
             LOGGER.error("Error getting status: %s", error)
@@ -651,8 +697,11 @@ class BLEDOMInstance:
                         ble_device_callback=lambda: self._device,
                     )
             except asyncio.TimeoutError:
+                # Re-raise rather than return: returning leaves self._client None
+                # and the caller's _write_while_connected then dereferences None
+                # (uncaught AttributeError). Raising lets @retry handle/retry it.
                 LOGGER.error("%s: Connection attempt timed out; RSSI: %s", self.name, self.rssi)
-                return
+                raise
 
             LOGGER.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
             
@@ -839,7 +888,9 @@ class BLEDOMInstance:
     def _disconnect(self) -> None:
         """Disconnect from device."""
         self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
+        # Keep a strong reference (asyncio holds only a weak one) so the task
+        # can't be garbage-collected mid-await, which would leak the connection.
+        self._disconnect_task = asyncio.create_task(self._execute_timed_disconnect())
 
     async def stop(self) -> None:
         """Stop the LEDBLE."""
@@ -853,12 +904,20 @@ class BLEDOMInstance:
             self.name,
             self._delay,
         )
-        await self._execute_disconnect()
-    async def _execute_disconnect(self) -> None:
+        await self._execute_disconnect(timed=True)
+
+    async def _execute_disconnect(self, timed: bool = False) -> None:
         """Execute disconnection."""
         # Use the operation lock (not just the connect lock) so a disconnect can
         # never run between _ensure_connected() and the write inside _write().
         async with self._operation_lock:
+            # For idle (timed) disconnects: if a command refreshed the connection
+            # while this was queued behind it on the lock, it re-armed the idle
+            # timer -- skip the now-stale teardown so we don't kill a connection
+            # that's actively in use (which would force an immediate reconnect).
+            if timed and self._disconnect_timer is not None:
+                LOGGER.debug("%s: Skipping stale idle disconnect; connection was refreshed", self.name)
+                return
             read_char = self._read_uuid if hasattr(self, '_read_uuid') else None
             client = self._client
             LOGGER.debug("Disconnecting: READ_UUID=%s, CLIENT_CONNECTED=%s", read_char, client.is_connected if client else "No Client")
