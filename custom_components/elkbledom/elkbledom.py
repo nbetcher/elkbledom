@@ -28,7 +28,7 @@ BLEAK_BACKOFF_TIME = 0.25
 # Delay between the two login writes required by MELK/MODELX devices before
 # service discovery. Kept as a named constant so it can be tuned in one place;
 # only paid once per (re)connect for those device families.
-LOGIN_STEP_DELAY = 0.4
+LOGIN_STEP_DELAY = 1.0
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
@@ -755,39 +755,20 @@ class BLEDOMInstance:
 
 
     def _notification_handler(self, _sender: int, data: bytearray) -> None:
-        """Handle notification responses."""
-        self._notification_received = True  # Mark that we got a response
-        LOGGER.info("%s: ✓ Notification received (%d bytes): %s", self.name, len(data), ' '.join(f'{x:02x}' for x in data))
-        
-        # Parse notification data if available
-        if len(data) >= 9 and data[0] == 0x7e and data[8] == 0xef:
-            # Valid response packet
-            cmd_type = data[2]
-            
-            # Status response (0x01)
-            if cmd_type == 0x01:
-                # Power state might be in data[3]
-                power_state = data[3]
-                if power_state in [0x23, 0xf0, 0x01]:
-                    self._is_on = True
-                    LOGGER.debug("%s: Parsed power state: ON", self.name)
-                elif power_state in [0x24, 0x00]:
-                    self._is_on = False
-                    LOGGER.debug("%s: Parsed power state: OFF", self.name)
-                
-                # Try to parse RGB color if available
-                if len(data) >= 8:
-                    r, g, b = data[4], data[5], data[6]
-                    if r != 0xff or g != 0xff or b != 0xff:  # Not default/invalid values
-                        self._rgb_color = (r, g, b)
-                        LOGGER.debug("%s: Parsed RGB color: (%d, %d, %d)", self.name, r, g, b)
-                
-                # Brightness might be in data[7]
-                if len(data) >= 8 and data[7] != 0xff:
-                    brightness_percent = data[7]
-                    self._brightness = int(brightness_percent * 255 / 100)
-                    LOGGER.debug("%s: Parsed brightness: %d%%", self.name, brightness_percent)
-        
+        """Handle notification data from the device.
+
+        These ELK-BLE* strips echo every command we write back on the notify
+        characteristic; they do not emit reliable status frames. The echoed
+        brightness/white command (7e 04 01 <i> ff 00 ff 00 ef) has 0x01 at
+        byte[2], so the previous parser mistook it for a status reply and read
+        bytes 4-6 (ff 00 ff) as RGB magenta and byte[7] (0x00) as 0% brightness
+        -- corrupting state so every colour change reported magenta and dropped
+        brightness to zero. The command methods are the source of truth for
+        power/colour/brightness, so we only log here and never overwrite state
+        from these echoes.
+        """
+        self._notification_received = True
+        LOGGER.debug("%s: Notification (command echo) received (%d bytes): %s", self.name, len(data), ' '.join(f'{x:02x}' for x in data))
         return
 
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
