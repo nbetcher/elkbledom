@@ -42,11 +42,17 @@ class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
 
     @property
     def options(self) -> list[str]:
-        return MIC_EFFECTS_list
+        # ELK/DOM strips only support 4 EQ modes (0x80-0x83); only MELK/MODELX
+        # expose the full 8. Showing the extra four on a DOM strip is misleading
+        # because the device clamps them all to the last valid mode.
+        name = (self._instance.name or "").lower()
+        if name.startswith(("melk", "modelx")):
+            return MIC_EFFECTS_list
+        return MIC_EFFECTS_list[:4]
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        if option in MIC_EFFECTS_list:
+        if option in self.options:
             effect_value = MIC_EFFECTS[option].value
             await self._instance.set_mic_effect(effect_value)
             self._current_option = option
@@ -56,9 +62,9 @@ class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
         """Restore previous state when entity is added to hass."""
         await super().async_added_to_hass()
         
-        # Restore the last known mic effect
+        # Restore the last known mic effect (only if still valid for this model)
         if (last_state := await self.async_get_last_state()) is not None:
-            if last_state.state in MIC_EFFECTS_list:
+            if last_state.state in self.options:
                 self._current_option = last_state.state
                 LOG.debug(f"Restored mic effect for {self.name}: {self._current_option}")
             else:

@@ -360,12 +360,17 @@ class Model:
         return None
     
     def get_sync_time_cmd(self, internal_key: str, hour: int, minute: int, second: int, day_of_week: int) -> List[int]:
-        """Get sync time command (same for all models)"""
-        return [0x7e, 0x00, 0x83, hour, minute, second, day_of_week, 0x00, 0xef]
-    
+        """Get sync time command (same for all models).
+
+        Frame: 7E 07 83 <hour> <min> <sec> <weekday Sun=0..Sat=6> FF EF.
+        byte[1]=0x07 and byte[7]=0xFF per the vendor app; an earlier 0x00/0x00
+        form was never accepted by the firmware.
+        """
+        return [0x7e, 0x07, 0x83, hour, minute, second, day_of_week, 0xff, 0xef]
+
     def get_custom_time_cmd(self, internal_key: str, hour: int, minute: int, second: int, day_of_week: int) -> List[int]:
-        """Get custom time command (same for all models)"""
-        return [0x7e, 0x00, 0x83, hour, minute, second, day_of_week, 0x00, 0xef]
+        """Get custom time command (same frame as get_sync_time_cmd)."""
+        return [0x7e, 0x07, 0x83, hour, minute, second, day_of_week, 0xff, 0xef]
     
     def get_min_color_temp_kelvin(self, internal_key: str) -> int:
         """Get minimum color temperature in Kelvin for model by internal key"""

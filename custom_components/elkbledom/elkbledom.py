@@ -25,6 +25,16 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_ATTEMPTS = 3
 #DISCONNECT_DELAY = 120
 BLEAK_BACKOFF_TIME = 0.25
+# Minimum spacing between consecutive BLE writes to one strip. These controllers
+# silently drop a frame that arrives too soon after the previous one; the vendor
+# Android app paces its multi-frame sequences ~450ms apart. We keep a small gap
+# on every write (collision avoidance, barely perceptible) and add a longer
+# settle specifically after a mode switch (see MIC_EXIT_SETTLE). Enforced as a
+# min-gap-since-last-write so a single command after idle pays nothing.
+COMMAND_GAP = 0.15
+# Extra settle after the mic-power-off frame so the firmware finishes leaving
+# music mode before the following color/effect frame lands.
+MIC_EXIT_SETTLE = 0.3
 # Delay between the two login writes required by MELK/MODELX devices before
 # service discovery. Kept as a named constant so it can be tuned in one place;
 # only paid once per (re)connect for those device families.
@@ -137,6 +147,9 @@ class BLEDOMInstance:
         # it never blocks commands to other devices.
         self._operation_lock: asyncio.Lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
+        # Monotonic timestamp (loop clock) of the last GATT write, used to pace
+        # consecutive writes by COMMAND_GAP. None until the first write.
+        self._last_write_at: float | None = None
         self._disconnect_timer: asyncio.TimerHandle | None = None
         # Strong reference to the in-flight idle-disconnect task (asyncio only
         # keeps a weak ref, so without this it can be GC'd mid-await).
@@ -148,7 +161,7 @@ class BLEDOMInstance:
         self._rgb_color_base = (255, 255, 255)  # Base RGB without brightness scaling
         self._brightness = 255
         self._effect = None
-        self._effect_speed = 128  # Default medium speed (0-255 range)
+        self._effect_speed = 50  # Default medium speed (device range is 0-100)
         self._color_temp_kelvin = None
         self._mic_effect = None
         self._mic_sensitivity = 50
@@ -245,8 +258,16 @@ class BLEDOMInstance:
             await self._write_while_connected(data)
 
     async def _write_while_connected(self, data: bytearray):
+        # Pace consecutive frames: these strips drop a write that arrives too
+        # soon after the previous one. Only delays when commands are bunched
+        # (a lone command after idle finds the gap already elapsed).
+        if self._last_write_at is not None:
+            gap = COMMAND_GAP - (self.loop.time() - self._last_write_at)
+            if gap > 0:
+                await asyncio.sleep(gap)
         LOGGER.debug(''.join(format(x, ' 03x') for x in data))
         await self._client.write_gatt_char(self._write_uuid, data, False)
+        self._last_write_at = self.loop.time()
 
     async def _write_many(self, *data_items) -> None:
         """Send several commands under a single lock acquisition so a paired
@@ -260,6 +281,25 @@ class BLEDOMInstance:
             await self._ensure_connected()
             for data in items:
                 await self._write_while_connected(data)
+
+    async def _exit_mic_mode(self) -> None:
+        """Leave music/mic mode before issuing a normal display command.
+
+        The strip stays in music mode -- ignoring color, brightness, effect and
+        speed -- until it receives the mic-power-off frame. There is no dedicated
+        "exit" opcode; the vendor app's mic toggle sends 7E 04 07 00 FF FF FF 00
+        EF, and the strip then accepts the next normal frame. We only send it
+        when we believe mic mode is active, so ordinary commands aren't doubled.
+        A short settle lets the firmware finish switching modes before the
+        caller's frame lands (sent too quickly, the strip drops it and stays
+        stuck -- the symptom this fixes).
+        """
+        if not self._mic_enabled:
+            return
+        LOGGER.debug("%s: Exiting mic/music mode before normal command", self.name)
+        await self._write([0x7e, 0x04, 0x07, 0x00, 0xff, 0xff, 0xff, 0x00, 0xef])
+        self._mic_enabled = False
+        await asyncio.sleep(MIC_EXIT_SETTLE)
 
     @property
     def address(self):
@@ -365,6 +405,7 @@ class BLEDOMInstance:
     async def set_color_temp_kelvin(self, value: int, brightness: int) -> None:
         # White colours are represented by colour temperature percentage from 0x0 to 0x64 from warm to cool
         # Warm (0x0) is only the warm white LED, cool (0x64) is only the white LED and then a mixture between the two
+        await self._exit_mic_mode()
         min_temp = self._model.get_min_color_temp_kelvin(self._model_name)
         max_temp = self._model.get_max_color_temp_kelvin(self._model_name)
         if value < min_temp:
@@ -423,6 +464,7 @@ class BLEDOMInstance:
 
     @retry_bluetooth_connection_error
     async def set_color(self, rgb: Tuple[int, int, int], is_base_color: bool = False) -> None:
+        await self._exit_mic_mode()
         r, g, b = rgb
         color_cmd = self._model.get_color_cmd(self._model_name, r, g, b)
         if not color_cmd:
@@ -438,6 +480,7 @@ class BLEDOMInstance:
 
     @retry_bluetooth_connection_error
     async def set_white(self, intensity: int) -> None:
+        await self._exit_mic_mode()
         if intensity is None:
             intensity = 255  # Valor por defecto si no se especifica
         white_cmd = self._model.get_white_cmd(self._model_name, intensity)
@@ -447,6 +490,7 @@ class BLEDOMInstance:
     @retry_bluetooth_connection_error
     async def set_brightness(self, intensity: int) -> None:
         """Set brightness with configurable mode (auto/rgb/native)."""
+        await self._exit_mic_mode()
         value = max(1, min(int(intensity), 255))
         percent = round(value * 100 / 255)  # logging only; commands scale internally
         mode = (self._brightness_mode or "auto").lower()
@@ -511,24 +555,36 @@ class BLEDOMInstance:
             
     @retry_bluetooth_connection_error
     async def set_effect_speed(self, value: int) -> None:
+        # Device speed is a 0-100 percent; clamp so an out-of-range value (e.g. a
+        # restored 0-255 value from before this range fix) isn't sent verbatim.
+        value = max(0, min(int(value), 100))
         effect_speed = self._model.get_effect_speed_cmd(self._model_name, value)
         await self._write(effect_speed)
         self._effect_speed = value
 
     @retry_bluetooth_connection_error
     async def set_effect(self, value: int) -> None:
+        await self._exit_mic_mode()
         effect = self._model.get_effect_cmd(self._model_name, value)
         await self._write(effect)
         self._effect = value
 
     @retry_bluetooth_connection_error
     async def set_mic_effect(self, value: int) -> None:
-        """Set microphone effect (0x80-0x87)."""
-        if not 0x80 <= value <= 0x87:
-            LOGGER.warning("Invalid mic effect value: 0x%02x, must be between 0x80 and 0x87", value)
-            return
+        """Set the microphone EQ mode (music-reactive).
+
+        ELK/DOM strips expose 4 EQ modes (0x80-0x83); only MELK/MODELX widen to
+        8 (0x80-0x87). The vendor app clamps the value to the model's range, so
+        we do the same instead of sending an out-of-range byte to a DOM strip.
+        Selecting an EQ puts the strip in music mode, so we record that here; the
+        next normal command then knows to send an explicit mic-off first.
+        """
+        name = (self._device.name or "").lower()
+        max_effect = 0x87 if name.startswith(("melk", "modelx")) else 0x83
+        value = min(max(int(value), 0x80), max_effect)
         await self._write([0x7e, 0x05, 0x03, value, 0x04, 0xff, 0xff, 0x00, 0xef])
         self._mic_effect = value
+        self._mic_enabled = True
         LOGGER.debug("Mic effect set to: 0x%02x", value)
 
     @retry_bluetooth_connection_error
@@ -550,9 +606,15 @@ class BLEDOMInstance:
 
     @retry_bluetooth_connection_error
     async def disable_mic(self) -> None:
-        """Disable external microphone."""
+        """Disable external microphone (manual exit from music mode).
+
+        Same frame as the automatic exit in _exit_mic_mode; the settle keeps a
+        color/effect command issued right after the toggle from arriving before
+        the strip has left music mode.
+        """
         await self._write([0x7e, 0x04, 0x07, 0x00, 0xff, 0xff, 0xff, 0x00, 0xef])
         self._mic_enabled = False
+        await asyncio.sleep(MIC_EXIT_SETTLE)
         LOGGER.debug("External microphone disabled")
 
     @retry_bluetooth_connection_error
@@ -573,7 +635,9 @@ class BLEDOMInstance:
             value = days + 0x80
         else:
             value = days
-        await self._write([0x7e, 0x00, 0x82, hours, minutes, 0x00, 0x00, value, 0xef])
+        # byte[1]=0x08 (frame length), byte[6]=0x00 selects the ON timer,
+        # byte[7] bit7 (0x80) = timer enabled.
+        await self._write([0x7e, 0x08, 0x82, hours, minutes, 0x00, 0x00, value, 0xef])
 
     @retry_bluetooth_connection_error
     async def set_scheduler_off(self, days: int, hours: int, minutes: int, enabled: bool) -> None:
@@ -581,12 +645,16 @@ class BLEDOMInstance:
             value = days + 0x80
         else:
             value = days
-        await self._write([0x7e, 0x00, 0x82, hours, minutes, 0x00, 0x01, value, 0xef])
+        # Same frame as the ON timer but byte[6]=0x01 selects the OFF timer.
+        await self._write([0x7e, 0x08, 0x82, hours, minutes, 0x00, 0x01, value, 0xef])
 
     @retry_bluetooth_connection_error
     async def sync_time(self) -> None:
         date = datetime.date.today()
-        year, week_num, day_of_week = date.isocalendar()
+        # The strip's weekday byte is Sunday-based (Sun=0 .. Sat=6), matching
+        # the app's Calendar.DAY_OF_WEEK-1. isoweekday() is Mon=1..Sun=7, so
+        # mod 7 maps Sun(7)->0 and leaves Mon..Sat as 1..6.
+        day_of_week = date.isoweekday() % 7
         now = datetime.datetime.now()
         cmd = self._model.get_sync_time_cmd(
             self._model_name,

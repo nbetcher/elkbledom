@@ -25,7 +25,7 @@ async def async_setup_entry(
 ) -> None:
     instance = hass.data[DOMAIN][config_entry.entry_id]
     entities = [BLEDOMMicSensitivity(instance, "Mic Sensitivity " + config_entry.data["name"], config_entry.entry_id)]
-    if instance.model.get_effect_speed_cmd(instance.model_name, 128):
+    if instance.model.get_effect_speed_cmd(instance.model_name, 50):
         entities.append(BLEDOMEffectSpeed(instance, "Effect Speed " + config_entry.data["name"], config_entry.entry_id))
     async_add_entities(entities)
 
@@ -51,7 +51,9 @@ class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
 
     @property
     def native_max_value(self) -> int:
-        return 255
+        # The strip's speed byte is a 0-100 percent; values above 100 are out of
+        # range for the firmware (the vendor app clamps to 100).
+        return 100
 
     @property
     def native_step(self) -> int:
