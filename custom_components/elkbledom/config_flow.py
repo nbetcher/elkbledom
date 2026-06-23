@@ -14,13 +14,18 @@ from homeassistant.components.bluetooth import (
     async_discovered_service_info,
 )
 
-from .const import DOMAIN, CONF_RESET, CONF_DELAY, CONF_MODEL, CONF_EFFECTS_CLASS, EFFECTS_MAP, DEFAULT_RESET, DEFAULT_DELAY
+from .const import DOMAIN, CONF_RESET, CONF_DELAY, CONF_MODEL, CONF_EFFECTS_CLASS, EFFECTS_MAP, DEFAULT_RESET, DEFAULT_DELAY, MIN_DELAY, MAX_DELAY
 import logging
 
 LOGGER = logging.getLogger(__name__)
 DATA_SCHEMA = vol.Schema({("host"): str})
 
 MANUAL_MAC = "manual"
+
+# Connection timeout (idle disconnect, seconds). Coerce to int and clamp into
+# [MIN_DELAY, MAX_DELAY] so an out-of-range entry is silently capped rather than
+# rejected. 0 keeps the connection alive (never disconnect).
+DELAY_VALIDATOR = vol.All(vol.Coerce(int), vol.Clamp(min=MIN_DELAY, max=MAX_DELAY))
 
 class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -159,15 +164,9 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             if "flicker" in user_input:
                 if user_input["flicker"]:
-                    entry_data = {CONF_MAC: self.mac, "name": self.name}
-                    if self._model_name:
-                        entry_data[CONF_MODEL] = self._model_name
-                        LOGGER.debug("Saving model to entry_data: %s", self._model_name)
-                    if self._effects_class:
-                        entry_data[CONF_EFFECTS_CLASS] = self._effects_class
-                        LOGGER.debug("Saving effects_class to entry_data: %s", self._effects_class)
-                    LOGGER.debug("Creating entry with data: %s", entry_data)
-                    return self.async_create_entry(title=self.name, data=entry_data)
+                    # Connection verified -- collect per-device settings
+                    # (connection timeout) before creating the entry.
+                    return await self.async_step_settings()
                 # Light didn't blink -- or the box was left unchecked by accident.
                 # Re-run validation (re-toggle and ask again) instead of hard
                 # aborting, so a single misclick doesn't drop the discovered device.
@@ -191,6 +190,33 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="validate", data_schema=vol.Schema(
                 {
                     vol.Required("flicker"): bool
+                }
+            ), errors={})
+
+    async def async_step_settings(self, user_input: "dict[str, Any] | None" = None):
+        """Collect per-device connection settings, then create the entry."""
+        if user_input is not None:
+            entry_data = {CONF_MAC: self.mac, "name": self.name}
+            if self._model_name:
+                entry_data[CONF_MODEL] = self._model_name
+                LOGGER.debug("Saving model to entry_data: %s", self._model_name)
+            if self._effects_class:
+                entry_data[CONF_EFFECTS_CLASS] = self._effects_class
+                LOGGER.debug("Saving effects_class to entry_data: %s", self._effects_class)
+            # Store the timeout in options (where the OptionsFlow also manages it)
+            # so the two never diverge; _entry_option reads options then data.
+            delay = user_input[CONF_DELAY]
+            LOGGER.debug("Creating entry with data: %s, delay: %s", entry_data, delay)
+            return self.async_create_entry(
+                title=self.name,
+                data=entry_data,
+                options={CONF_DELAY: delay},
+            )
+
+        return self.async_show_form(
+            step_id="settings", data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_DELAY, default=DEFAULT_DELAY): DELAY_VALIDATOR
                 }
             ), errors={})
 
@@ -272,7 +298,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_user(self, user_input=None):
         """Handle a flow initialized by the user."""
         errors = {}
-        options = self.config_entry.options or {CONF_RESET: DEFAULT_RESET, CONF_DELAY: DEFAULT_DELAY}
         current_model = self.config_entry.options.get(CONF_MODEL) or self.config_entry.data.get(CONF_MODEL)
         
         if user_input is not None:
@@ -305,8 +330,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         effects_classes_dict = {class_name: class_name for class_name in EFFECTS_MAP.keys()}
         
         schema_dict = {
-            vol.Optional(CONF_RESET, default=options.get(CONF_RESET)): bool,
-            vol.Optional(CONF_DELAY, default=options.get(CONF_DELAY)): int,
+            vol.Optional(CONF_RESET, default=self.config_entry.options.get(CONF_RESET, DEFAULT_RESET)): bool,
+            vol.Optional(CONF_DELAY, default=self.config_entry.options.get(CONF_DELAY, DEFAULT_DELAY)): DELAY_VALIDATOR,
         }
         
         # Add model selector if models are available

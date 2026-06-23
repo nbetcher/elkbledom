@@ -15,6 +15,15 @@
                 },
                 "title": "Validate Elkbledom connection"
             },
+            "settings": {
+                "data": {
+                    "delay": "Connection timeout (seconds)"
+                },
+                "data_description": {
+                    "delay": "0 = never disconnect. Range 0–3600 (1 hour); larger values are capped."
+                },
+                "title": "Connection settings"
+            },
             "manual": {
                 "data": {
                     "mac": "Bluetooth MAC address",
@@ -38,7 +47,10 @@
           "user": {
             "data": {
               "reset": "Reset color when led turn on",
-              "delay": "Disconnect delay in seconds (0 equal never disconnect)"
+              "delay": "Connection timeout (seconds)"
+            },
+            "data_description": {
+              "delay": "0 = never disconnect. Range 0–3600 (1 hour); larger values are capped."
             }
           }
         }

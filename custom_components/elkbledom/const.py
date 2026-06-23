@@ -11,6 +11,12 @@ CONF_EFFECTS_CLASS = "effects_class"
 # Defaults for config/options
 DEFAULT_RESET = False
 DEFAULT_DELAY = 120
+# Connection-timeout (idle disconnect) bounds, in seconds. 0 = never disconnect
+# (keep the BLE connection alive). There is no hard device/protocol limit, so the
+# upper bound is a sane cap -- 1 hour; anything longer is effectively "never", for
+# which 0 exists. Values outside this range are clamped, not rejected.
+MIN_DELAY = 0
+MAX_DELAY = 3600
 
 # Brightness mode configuration
 CONF_BRIGHTNESS_MODE = "brightness_mode"
