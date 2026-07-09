@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import voluptuous as vol
 
@@ -9,6 +10,8 @@ from homeassistant.const import CONF_MAC, EVENT_HOMEASSISTANT_STOP, ATTR_ENTITY_
 from homeassistant.const import Platform
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth import BluetoothCallbackMatcher, BluetoothScanningMode
 
 from .const import (
     DOMAIN,
@@ -116,7 +119,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     instance = BLEDOMInstance(entry.data[CONF_MAC], reset, delay, hass, forced_model, brightness_mode, entry.data.get("name"))
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = instance
-   
+
+    # Keep the connectable BLEDevice fresh and drive availability from the strip's
+    # advertisements (the canonical HA BLE pattern). Both registrations are torn
+    # down automatically on unload via entry.async_on_unload.
+    entry.async_on_unload(
+        bluetooth.async_register_callback(
+            hass,
+            instance._async_update_ble,
+            BluetoothCallbackMatcher(address=instance.address, connectable=True),
+            BluetoothScanningMode.PASSIVE,
+        )
+    )
+    entry.async_on_unload(
+        bluetooth.async_track_unavailable(
+            hass, instance._async_unavailable, instance.address, connectable=True
+        )
+    )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
@@ -197,12 +217,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, SERVICE_SYNC_TIME):
         async def handle_sync_time(call: ServiceCall) -> None:
-            """Sync the device clock to Home Assistant's current time."""
-            for instance in _instances_for_entities(hass, call.data[ATTR_ENTITY_ID]):
-                try:
-                    await instance.sync_time()
-                except Exception as err:
-                    LOGGER.error("sync_time failed for %s: %s", instance.address, err)
+            """Sync every targeted device's clock concurrently."""
+            instances = _instances_for_entities(hass, call.data[ATTR_ENTITY_ID])
+            results = await asyncio.gather(
+                *(inst.sync_time() for inst in instances), return_exceptions=True
+            )
+            for inst, res in zip(instances, results):
+                if isinstance(res, Exception):
+                    LOGGER.error("sync_time failed for %s: %s", inst.address, res)
 
         hass.services.async_register(
             DOMAIN,
@@ -213,13 +235,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, SERVICE_SCHEDULE_ON):
         async def handle_schedule_on(call: ServiceCall) -> None:
-            """Program the device's daily turn-on timer."""
+            """Program every targeted device's daily turn-on timer concurrently."""
             mask = _days_to_mask(call.data["days"])
-            for instance in _instances_for_entities(hass, call.data[ATTR_ENTITY_ID]):
-                try:
-                    await instance.set_scheduler_on(mask, call.data["hour"], call.data["minute"], call.data["enabled"])
-                except Exception as err:
-                    LOGGER.error("schedule_on failed for %s: %s", instance.address, err)
+            instances = _instances_for_entities(hass, call.data[ATTR_ENTITY_ID])
+            results = await asyncio.gather(
+                *(inst.set_scheduler_on(mask, call.data["hour"], call.data["minute"], call.data["enabled"]) for inst in instances),
+                return_exceptions=True,
+            )
+            for inst, res in zip(instances, results):
+                if isinstance(res, Exception):
+                    LOGGER.error("schedule_on failed for %s: %s", inst.address, res)
 
         hass.services.async_register(
             DOMAIN,
@@ -230,13 +255,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, SERVICE_SCHEDULE_OFF):
         async def handle_schedule_off(call: ServiceCall) -> None:
-            """Program the device's daily turn-off timer."""
+            """Program every targeted device's daily turn-off timer concurrently."""
             mask = _days_to_mask(call.data["days"])
-            for instance in _instances_for_entities(hass, call.data[ATTR_ENTITY_ID]):
-                try:
-                    await instance.set_scheduler_off(mask, call.data["hour"], call.data["minute"], call.data["enabled"])
-                except Exception as err:
-                    LOGGER.error("schedule_off failed for %s: %s", instance.address, err)
+            instances = _instances_for_entities(hass, call.data[ATTR_ENTITY_ID])
+            results = await asyncio.gather(
+                *(inst.set_scheduler_off(mask, call.data["hour"], call.data["minute"], call.data["enabled"]) for inst in instances),
+                return_exceptions=True,
+            )
+            for inst, res in zip(instances, results):
+                if isinstance(res, Exception):
+                    LOGGER.error("schedule_off failed for %s: %s", inst.address, res)
 
         hass.services.async_register(
             DOMAIN,

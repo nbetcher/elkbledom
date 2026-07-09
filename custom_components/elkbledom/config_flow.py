@@ -282,6 +282,9 @@ class BLEDOMFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         finally:
             if self._instance:
                 await self._instance.stop()
+                # Drop the throwaway validation instance so nothing lingers past
+                # the flow (stop() also cancels its idle timer/task).
+                self._instance = None
 
     @staticmethod
     @callback

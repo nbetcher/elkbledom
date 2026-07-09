@@ -56,6 +56,7 @@ class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
             effect_value = MIC_EFFECTS[option].value
             await self._instance.set_mic_effect(effect_value)
             self._current_option = option
+            self.async_write_ha_state()
             LOG.debug(f"Mic effect set to {option} (0x{effect_value:02x})")
 
     async def async_added_to_hass(self) -> None:

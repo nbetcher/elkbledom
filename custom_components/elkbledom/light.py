@@ -36,6 +36,12 @@ async def async_setup_entry(hass, config_entry, async_add_devices) -> None:
     async_add_devices([BLEDOMLight(instance, config_entry.data["name"], config_entry.entry_id)])
 
 class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
+    # The strip has no state readback, so reported state is optimistic. Declaring
+    # assumed_state makes the UI show explicit on/off buttons instead of a toggle
+    # that implies confirmed truth (correct for an IR-remote/power-cut-desyncable
+    # device).
+    _attr_assumed_state = True
+
     def __init__(self, bledomInstance: BLEDOMInstance, name: str, entry_id: str) -> None:
         self._instance = bledomInstance
         self._entry_id = entry_id

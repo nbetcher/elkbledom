@@ -15,7 +15,13 @@ from bleak_retry_connector import (
     BleakNotFoundError,
     establish_connection,
 )
-from homeassistant.components.bluetooth import async_discovered_service_info, async_ble_device_from_address
+from homeassistant.components.bluetooth import (
+    async_discovered_service_info,
+    async_ble_device_from_address,
+    BluetoothServiceInfoBleak,
+    BluetoothChange,
+)
+from homeassistant.core import callback
 from home_assistant_bluetooth import BluetoothServiceInfo
 
 from .model import Model
@@ -62,15 +68,18 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
             except BleakNotFoundError:
                 # The lock cannot be found so there is no
                 # point in retrying.
+                self._set_available(False)
                 raise
             except RETRY_BACKOFF_EXCEPTIONS as err:
                 if attempt >= max_attempts:
+                    self._set_available(False)
                     LOGGER.debug("%s: %s error calling %s, reach max attempts (%s/%s)",self.name,type(err),func,attempt,max_attempts,exc_info=True,)
                     raise
                 LOGGER.debug("%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",self.name,type(err),func,BLEAK_BACKOFF_TIME,attempt,max_attempts,exc_info=True,)
                 await asyncio.sleep(BLEAK_BACKOFF_TIME)
             except BLEAK_EXCEPTIONS as err:
                 if attempt >= max_attempts:
+                    self._set_available(False)
                     LOGGER.debug("%s: %s error calling %s, reach max attempts (%s/%s): %s",self.name,type(err),func,attempt,max_attempts,err,exc_info=True,)
                     raise
                 LOGGER.debug("%s: %s error calling %s, backing off %ss, retrying  (%s/%s)...: %s",self.name,type(err),func,BLEAK_BACKOFF_TIME,attempt,max_attempts,err,exc_info=True,)
@@ -171,14 +180,23 @@ class BLEDOMInstance:
         self._color_temp = None
         self._read_uuid = None
         self._write_uuid = None
-        
+        # Entity state-update callbacks (availability / mic state pushes) and the
+        # advertisement-driven availability flag. Optimistic-True until the strip
+        # is proven gone (stops advertising AND isn't connected, or a command
+        # fails after retries). Latest RSSI is refreshed from advertisements.
+        self._callbacks: List[Callable[[], None]] = []
+        self._available = True
+        self._rssi_latest: int | None = None
+
         # Brightness mode configuration (auto, rgb, native), seeded from config
         mode = (brightness_mode or "auto").lower()
         self._brightness_mode = mode if mode in ("auto", "rgb", "native") else "auto"
 
 
         try:
-            self._device = async_ble_device_from_address(hass, self._address)
+            # connectable=True: we need a link we can actually open (via a proxy or
+            # a local adapter), not just an advertisement-only device.
+            self._device = async_ble_device_from_address(hass, self._address, connectable=True)
         except (Exception) as error:
             LOGGER.error("Error getting device: %s", error)
 
@@ -245,7 +263,62 @@ class BLEDOMInstance:
 
     def get_color_base(self):
         return self._rgb_color_base
-            
+
+    def register_callback(self, callback_fn: Callable[[], None]) -> Callable[[], None]:
+        """Register an entity state-update callback; returns an unregister fn.
+
+        Entities register ``self.async_write_ha_state`` so an availability change
+        or a mic-mode transition pushes fresh state to HA without polling.
+        """
+        def unregister() -> None:
+            if callback_fn in self._callbacks:
+                self._callbacks.remove(callback_fn)
+        self._callbacks.append(callback_fn)
+        return unregister
+
+    def _fire_callbacks(self) -> None:
+        """Notify every registered entity to refresh its state."""
+        for cb in list(self._callbacks):
+            cb()
+
+    @property
+    def available(self) -> bool:
+        """Whether the strip is reachable (advertising, connected, or recently so)."""
+        return self._available
+
+    def _set_available(self, available: bool) -> None:
+        """Flip availability and push it to entities only on a real change."""
+        if available == self._available:
+            return
+        self._available = available
+        LOGGER.debug("%s: availability -> %s", self.name, "available" if available else "unavailable")
+        self._fire_callbacks()
+
+    @callback
+    def _async_update_ble(self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange) -> None:
+        """Refresh the connectable BLEDevice + RSSI from a live advertisement.
+
+        Keeps ``self._device`` current so (re)connects target the present best
+        path (the canonical HA BLE pattern), and treats a fresh advertisement as
+        proof the strip is reachable.
+        """
+        self._device = service_info.device
+        self._rssi_latest = service_info.rssi
+        self._set_available(True)
+
+    @callback
+    def _async_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Mark unavailable when the strip stops advertising.
+
+        Guarded by the live connection: a strip we hold a link to may stop
+        advertising, so the "gone" signal is ignored while connected. When the
+        link later drops or a command fails after retries, availability flips
+        through those paths instead (avoids flapping on a busy single radio).
+        """
+        if self._client and self._client.is_connected:
+            return
+        self._set_available(False)
+
     async def _write(self, data: bytearray):
         """Send command to device and read response."""
         if not data:
@@ -268,6 +341,9 @@ class BLEDOMInstance:
         LOGGER.debug(''.join(format(x, ' 03x') for x in data))
         await self._client.write_gatt_char(self._write_uuid, data, False)
         self._last_write_at = self.loop.time()
+        # A successful write proves the strip is reachable even when it isn't
+        # advertising (e.g. while we hold the connection).
+        self._set_available(True)
 
     async def _write_many(self, *data_items) -> None:
         """Send several commands under a single lock acquisition so a paired
@@ -299,6 +375,7 @@ class BLEDOMInstance:
         LOGGER.debug("%s: Exiting mic/music mode before normal command", self.name)
         await self._write([0x7e, 0x04, 0x07, 0x00, 0xff, 0xff, 0xff, 0x00, 0xef])
         self._mic_enabled = False
+        self._fire_callbacks()
         await asyncio.sleep(MIC_EXIT_SETTLE)
 
     @property
@@ -336,6 +413,8 @@ class BLEDOMInstance:
 
     @property
     def rssi(self):
+        if self._rssi_latest is not None:
+            return self._rssi_latest
         return 0 if self._device_data is None else self._device_data.rssi
 
     @property
@@ -585,6 +664,7 @@ class BLEDOMInstance:
         await self._write([0x7e, 0x05, 0x03, value, 0x04, 0xff, 0xff, 0x00, 0xef])
         self._mic_effect = value
         self._mic_enabled = True
+        self._fire_callbacks()
         LOGGER.debug("Mic effect set to: 0x%02x", value)
 
     @retry_bluetooth_connection_error
@@ -602,6 +682,7 @@ class BLEDOMInstance:
         """Enable external microphone."""
         await self._write([0x7e, 0x04, 0x07, 0x01, 0xff, 0xff, 0xff, 0x00, 0xef])
         self._mic_enabled = True
+        self._fire_callbacks()
         LOGGER.debug("External microphone enabled")
 
     @retry_bluetooth_connection_error
@@ -614,6 +695,7 @@ class BLEDOMInstance:
         """
         await self._write([0x7e, 0x04, 0x07, 0x00, 0xff, 0xff, 0xff, 0x00, 0xef])
         self._mic_enabled = False
+        self._fire_callbacks()
         await asyncio.sleep(MIC_EXIT_SETTLE)
         LOGGER.debug("External microphone disabled")
 
@@ -762,7 +844,19 @@ class BLEDOMInstance:
                         self.name,
                         self._disconnected,
                         cached_services=self._cached_services,
-                        ble_device_callback=lambda: self._device,
+                        # Re-query HA for the freshest connectable device each
+                        # attempt (falling back to the last known one) so the
+                        # retry connector can pick the current best proxy path
+                        # instead of a device frozen at setup time.
+                        ble_device_callback=lambda: (
+                            async_ble_device_from_address(self._hass, self._address, connectable=True)
+                            or self._device
+                        ),
+                        # One connect attempt here; the outer
+                        # @retry_bluetooth_connection_error owns the retry budget
+                        # so the two layers don't multiply into a long, radio-
+                        # hogging storm under the operation lock.
+                        max_attempts=1,
                     )
             except asyncio.TimeoutError:
                 # Re-raise rather than return: returning leaves self._client None
@@ -855,6 +949,7 @@ class BLEDOMInstance:
             LOGGER.debug("%s: Characteristics resolved: %s; RSSI: %s", self.name, resolved, self.rssi)
 
             self._client = client
+            self._set_available(True)
             self._reset_disconnect_timer()
 
             # Enable notifications (simple method, no manual CCCD)
@@ -961,8 +1056,26 @@ class BLEDOMInstance:
         self._disconnect_task = asyncio.create_task(self._execute_timed_disconnect())
 
     async def stop(self) -> None:
-        """Stop the LEDBLE."""
+        """Stop the strip and release its timers/tasks (called on unload)."""
         LOGGER.debug("%s: Stop", self.name)
+        # Cancel the pending idle-disconnect timer so it can't fire after the
+        # instance is torn down -- otherwise a live TimerHandle bound to
+        # self._disconnect keeps the instance alive for up to `delay` seconds.
+        if self._disconnect_timer is not None:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+        # Cancel/await any in-flight idle-disconnect task, but never self-await
+        # (stop() may run while a timed disconnect task is executing).
+        task = self._disconnect_task
+        self._disconnect_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                LOGGER.debug("%s: idle-disconnect task cleanup: %s", self.name, e)
         await self._execute_disconnect()
 
     async def _execute_timed_disconnect(self) -> None:

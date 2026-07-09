@@ -23,11 +23,26 @@ class BLEDOMEntity:
     """
 
     _instance: "BLEDOMInstance"
+    # These entities are push-based (state is written after each command and on
+    # advertisement/availability changes); HA must not schedule periodic polls.
+    _attr_should_poll = False
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to instance state pushes (availability, mic mode)."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self._instance.register_callback(self.async_write_ha_state)
+        )
 
     @property
     def available(self) -> bool:
-        """No reliable state readback exists; available once is_on is known."""
-        return self._instance.is_on is not None
+        """Reachable per the strip's advertisements / recent successful commands.
+
+        Driven by the bluetooth advertisement tracker and the write path (see
+        BLEDOMInstance), so an unplugged or out-of-range strip is reported
+        unavailable instead of latching online forever.
+        """
+        return self._instance.available
 
     @property
     def device_info(self) -> DeviceInfo:
