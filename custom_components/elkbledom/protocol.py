@@ -157,6 +157,6 @@ class ElkProtocol:
         value = days + 0x80 if enabled else days
         return [0x7e, 0x08, 0x82, hours, minutes, 0x00, 0x01 if off else 0x00, value, 0xef]
 
-    @staticmethod
-    def sync_time(hour: int, minute: int, second: int, weekday: int) -> List[int]:  # model.py:362-373
-        return [0x7e, 0x07, 0x83, hour, minute, second, weekday, 0xff, 0xef]
+    # NOTE: time-sync frames are NOT built here -- they stay in the Model table
+    # (Model.get_sync_time_cmd / get_custom_time_cmd, used by ElkDevice.sync_time /
+    # custom_time) as the single source, to avoid a duplicate that can drift.

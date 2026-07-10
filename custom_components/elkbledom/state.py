@@ -30,19 +30,13 @@ class ElkState:
     mic_enabled: bool = False                               # 177
     color_temp: Optional[int] = None                        # 180  0-100 warm; set_color_temp path
 
-    # --- base/rgb coupling helpers (the exact couplings that exist today) ---
-    def apply_color(self, rgb: Tuple[int, int, int], is_base: bool) -> None:
-        """Mirror set_color 555-558: always set rgb_color; set base only if is_base."""
-        self.rgb_color = rgb
-        if is_base:
-            self.rgb_color_base = rgb
-
-    def apply_scaled_color(self, scaled_rgb: Tuple[int, int, int]) -> None:
-        """Mirror set_brightness RGB path 593: rgb_color = scaled, base preserved."""
-        self.rgb_color = scaled_rgb
-
     def get_color_base(self) -> Tuple[int, int, int]:
-        """Mirror elkbledom.py:264."""
+        """The unscaled base RGB used for brightness scaling (elkbledom.py:264).
+
+        ElkDevice writes rgb_color / rgb_color_base directly (the couplings differ
+        per path -- e.g. the color-temp RGB fallback deliberately decouples base),
+        so there are no apply_color helpers; only this read accessor is shared.
+        """
         return self.rgb_color_base
 
     # --- optional convenience for the entity-migration phase (Phase 3) ---

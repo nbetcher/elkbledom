@@ -110,11 +110,15 @@ class BLEDOMMicSensitivity(BLEDOMEntity, RestoreEntity, NumberEntity):
         """Update the current value."""
         await self._device.set_mic_sensitivity(int(value))
         self._mic_sensitivity = int(value)
+        # Publish explicitly: with should_poll=False (CoordinatorEntity) HA no
+        # longer auto-writes state after the service call, and set_mic_sensitivity
+        # fires no coordinator push, so without this the slider snaps back.
+        self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
         """Restore previous state when entity is added to hass."""
         await super().async_added_to_hass()
-        
+
         # Restore the last known mic sensitivity
         if (last_state := await self.async_get_last_state()) is not None:
             try:

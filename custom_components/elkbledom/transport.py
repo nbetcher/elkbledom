@@ -38,10 +38,6 @@ COMMAND_GAP = 0.15
 # music mode before the following color/effect frame lands. Used by ElkDevice
 # (imported from here) so there is a single definition.
 MIC_EXIT_SETTLE = 0.3
-# Delay between the two login writes required by MELK/MODELX devices before
-# service discovery. Kept as a named constant so it can be tuned in one place;
-# only paid once per (re)connect for those device families.
-LOGIN_STEP_DELAY = 1.0
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
@@ -197,11 +193,6 @@ class BLETransport:
         self._available = available
         LOGGER.debug("%s: availability -> %s", self.name, "available" if available else "unavailable")
         self.fire_callbacks()
-
-    # Private alias: bodies moved from the god object still call the old private
-    # name in places; keep both resolving so a missed rename is not a runtime
-    # AttributeError (invisible to py_compile).
-    _set_available = set_available
 
     @callback
     def _async_update_ble(self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange) -> None:
@@ -524,18 +515,21 @@ class BLETransport:
         if self._disconnect_timer is not None:
             self._disconnect_timer.cancel()
             self._disconnect_timer = None
-        # Cancel/await any in-flight idle-disconnect task, but never self-await
-        # (stop() may run while a timed disconnect task is executing).
+        # If an idle-disconnect task is already in flight, AWAIT it to completion
+        # rather than cancelling it: that task is running the same clean
+        # client.disconnect() we want. Cancelling raised CancelledError (a
+        # BaseException, so uncaught by the `except Exception` in
+        # _execute_disconnect) INSIDE client.disconnect(), aborting the teardown;
+        # the fallback below then no-oped because the task had already nulled
+        # self._client -> the link was never cleanly closed. Awaiting also
+        # prevents the task leak this cleanup was added for. Never self-await.
         task = self._disconnect_task
         self._disconnect_task = None
         if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
             try:
                 await task
-            except asyncio.CancelledError:
-                pass
             except Exception as e:
-                LOGGER.debug("%s: idle-disconnect task cleanup: %s", self.name, e)
+                LOGGER.debug("%s: idle-disconnect task during stop: %s", self.name, e)
         await self._execute_disconnect()
 
     async def _execute_timed_disconnect(self) -> None:
