@@ -1,144 +1,61 @@
-import asyncio
-import datetime
-import traceback
+"""Thin ``BLEDOMInstance`` facade for the elkbledom integration.
+
+The former ~1000-line god object is decomposed into cohesive layers:
+
+* ``ElkState``     (state.py)     -- optimistic cache dataclass.
+* ``ElkProtocol``  (protocol.py)  -- model indirection + model-independent frames
+                                     (== the shared ``ModelContext``).
+* ``BLETransport`` (transport.py) -- connection lifecycle, write path + pacing,
+                                     ``@retry``, availability + callbacks, login,
+                                     characteristic resolution, idle-disconnect.
+* ``ElkDevice``    (device.py)    -- intents -> frames -> transport writes; holds
+                                     state, brightness-mode + mic-exit policy.
+
+``BLEDOMInstance`` composes that stack and re-exposes the ENTIRE public surface
+the entities / ``__init__.py`` / ``config_flow.py`` depend on (see the
+compatibility contract in docs/god-object-refactor.md §4): every method delegates
+to ``ElkDevice`` / ``BLETransport``; every property reads through; and the eight
+externally-written private attributes the light/switch restore paths poke
+(``_is_on``/``_brightness``/``_rgb_color``/``_rgb_color_base``/
+``_color_temp_kelvin``/``_effect``/``_effect_speed``/``_mic_enabled``) are exposed
+as data-descriptor property+setter pairs routed into the shared ``ElkState`` (so an
+external assignment takes effect on the same state the device reads -- §4.5).
+
+``DeviceData`` now lives in ``device_data.py`` (to break the transport<->facade
+import cycle, §2.5) and is re-exported here so ``config_flow.py:3``
+(``from .elkbledom import DeviceData``) keeps resolving unchanged.
+"""
+
 import logging
-from typing import Any, TypeVar, cast, Tuple, Optional, Dict, List
-from collections.abc import Callable
-from homeassistant.exceptions import ConfigEntryNotReady
 
-from bleak.backends.device import BLEDevice
-from bleak.backends.service import BleakGATTServiceCollection
-from bleak.exc import BleakDBusError
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
-from bleak_retry_connector import (
-    BleakClientWithServiceCache,
-    BleakNotFoundError,
-    establish_connection,
-)
-from homeassistant.components.bluetooth import (
-    async_discovered_service_info,
-    async_ble_device_from_address,
-    BluetoothServiceInfoBleak,
-    BluetoothChange,
-)
 from homeassistant.core import callback
-from home_assistant_bluetooth import BluetoothServiceInfo
 
-from .model import Model
+# Re-exported so ``from .elkbledom import DeviceData`` (config_flow.py:3) keeps
+# resolving after the class moved to device_data.py (§2.5 / §4.7). Do NOT remove.
+from .device_data import DeviceData  # noqa: F401  (re-export)
+from .state import ElkState
+from .protocol import ElkProtocol
+from .transport import BLETransport
+from .device import ElkDevice
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_ATTEMPTS = 3
-#DISCONNECT_DELAY = 120
-BLEAK_BACKOFF_TIME = 0.25
-# Minimum spacing between consecutive BLE writes to one strip. These controllers
-# silently drop a frame that arrives too soon after the previous one; the vendor
-# Android app paces its multi-frame sequences ~450ms apart. We keep a small gap
-# on every write (collision avoidance, barely perceptible) and add a longer
-# settle specifically after a mode switch (see MIC_EXIT_SETTLE). Enforced as a
-# min-gap-since-last-write so a single command after idle pays nothing.
-COMMAND_GAP = 0.15
-# Extra settle after the mic-power-off frame so the firmware finishes leaving
-# music mode before the following color/effect frame lands.
-MIC_EXIT_SETTLE = 0.3
-# Delay between the two login writes required by MELK/MODELX devices before
-# service discovery. Kept as a named constant so it can be tuned in one place;
-# only paid once per (re)connect for those device families.
-LOGIN_STEP_DELAY = 1.0
-RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
-WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
-
-def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
-    """Define a wrapper to retry on bleak error.
-
-    The accessory is allowed to disconnect us any time so
-    we need to retry the operation.
-    """
-
-    async def _async_wrap_retry_bluetooth_connection_error(
-        self: "BLEDOMInstance", *args: Any, **kwargs: Any
-    ) -> Any:
-        # LOGGER.debug("%s: Starting retry loop", self.name)
-        attempts = DEFAULT_ATTEMPTS
-        max_attempts = attempts - 1
-
-        for attempt in range(attempts):
-            try:
-                return await func(self, *args, **kwargs)
-            except BleakNotFoundError:
-                # The lock cannot be found so there is no
-                # point in retrying.
-                self._set_available(False)
-                raise
-            except RETRY_BACKOFF_EXCEPTIONS as err:
-                if attempt >= max_attempts:
-                    self._set_available(False)
-                    LOGGER.debug("%s: %s error calling %s, reach max attempts (%s/%s)",self.name,type(err),func,attempt,max_attempts,exc_info=True,)
-                    raise
-                LOGGER.debug("%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",self.name,type(err),func,BLEAK_BACKOFF_TIME,attempt,max_attempts,exc_info=True,)
-                await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            except BLEAK_EXCEPTIONS as err:
-                if attempt >= max_attempts:
-                    self._set_available(False)
-                    LOGGER.debug("%s: %s error calling %s, reach max attempts (%s/%s): %s",self.name,type(err),func,attempt,max_attempts,err,exc_info=True,)
-                    raise
-                LOGGER.debug("%s: %s error calling %s, backing off %ss, retrying  (%s/%s)...: %s",self.name,type(err),func,BLEAK_BACKOFF_TIME,attempt,max_attempts,err,exc_info=True,)
-                await asyncio.sleep(BLEAK_BACKOFF_TIME)
-
-    return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
-
-class CharacteristicMissingError(Exception):
-    """Raised when a characteristic is missing."""
-class DeviceData():
-    def __init__(self, hass, discovery_info):
-        self._discovery = discovery_info
-        model_manager = Model(hass)
-        detected_model = model_manager.detect_model(self._discovery.name or "")
-        self._supported = detected_model is not None
-        self._address = self._discovery.address
-        self._name = self._discovery.name
-        self._rssi = self._discovery.rssi
-        self._hass = hass
-        self._bledevice = async_ble_device_from_address(hass, self._address)
-        
-    @property
-    def is_supported(self) -> bool:
-        return self._supported
-
-    @property
-    def address(self):
-        return self._address
-
-    @property
-    def get_device_name(self):
-        return self._name
-
-    @property
-    def name(self):
-        return self._name
-
-    @property
-    def rssi(self):
-        return self._rssi
-    
-    def bledevice(self) -> BLEDevice:
-        return self._bledevice
-    
-    def update_device(self) -> None:
-        #TODO for discovery_info in async_last_service_info(self._hass, self._address):
-        for discovery_info in async_discovered_service_info(self._hass):
-            if discovery_info.address == self._address:
-                self._rssi = discovery_info.rssi
-                ##TODO SOMETHING WITH DEVICE discovery_info
-        return
-
-    def _start_update(self, service_info: BluetoothServiceInfo) -> None:
-        """Update from BLE advertisement data."""
-        LOGGER.debug("Parsing Govee BLE advertisement data: %s", service_info)
 
 class BLEDOMInstance:
-    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None, brightness_mode: str = "auto", config_name: str = None) -> None:
-        self.loop = asyncio.get_running_loop()
+    """Thin facade composing BLETransport + ElkProtocol + ElkState + ElkDevice.
+
+    The public surface (constructor signature + defaults, read properties, async
+    intents, the two ``@callback`` shims, and the eight externally-written private
+    attributes) is frozen by the compatibility contract in
+    docs/god-object-refactor.md §4. Nothing outside this module touches transport
+    internals directly.
+    """
+
+    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None,
+                 brightness_mode: str = "auto", config_name: str = None) -> None:
+        # Signature IDENTICAL to the god object (elkbledom.py:140). Two positional
+        # call sites: __init__.py:120 (7 args) and config_flow.py:265 (5 args,
+        # relying on the brightness_mode="auto" / config_name=None defaults).
         self._address = address
         self._reset = reset
         self._delay = delay
@@ -147,237 +64,40 @@ class BLEDOMInstance:
         # User-given name from the config entry; used as the single source for
         # every entity's DeviceInfo name so the device is labeled consistently.
         self._config_name = config_name
-        self._device: BLEDevice | None = None
-        self._device_data: DeviceData | None = None
-        self._connect_lock: asyncio.Lock = asyncio.Lock()
-        # Serializes whole write operations (connect + write) for THIS device so
-        # concurrent commands can't interleave on the characteristic and the idle
-        # disconnect can't tear down the client mid-write. It is per-instance, so
-        # it never blocks commands to other devices.
-        self._operation_lock: asyncio.Lock = asyncio.Lock()
-        self._client: BleakClientWithServiceCache | None = None
-        # Monotonic timestamp (loop clock) of the last GATT write, used to pace
-        # consecutive writes by COMMAND_GAP. None until the first write.
-        self._last_write_at: float | None = None
-        self._disconnect_timer: asyncio.TimerHandle | None = None
-        # Strong reference to the in-flight idle-disconnect task (asyncio only
-        # keeps a weak ref, so without this it can be GC'd mid-await).
-        self._disconnect_task: asyncio.Task | None = None
-        self._cached_services: BleakGATTServiceCollection | None = None
-        self._expected_disconnect = False
-        self._is_on = None
-        self._rgb_color = None
-        self._rgb_color_base = (255, 255, 255)  # Base RGB without brightness scaling
-        self._brightness = 255
-        self._effect = None
-        self._effect_speed = 50  # Default medium speed (device range is 0-100)
-        self._color_temp_kelvin = None
-        self._mic_effect = None
-        self._mic_sensitivity = 50
-        self._mic_enabled = False
-        self._model = None
-        self._model_name = None
-        self._color_temp = None
-        self._read_uuid = None
-        self._write_uuid = None
-        # Entity state-update callbacks (availability / mic state pushes) and the
-        # advertisement-driven availability flag. Optimistic-True until the strip
-        # is proven gone (stops advertising AND isn't connected, or a command
-        # fails after retries). Latest RSSI is refreshed from advertisements.
-        self._callbacks: List[Callable[[], None]] = []
-        self._available = True
-        self._rssi_latest: int | None = None
 
-        # Brightness mode configuration (auto, rgb, native), seeded from config
-        mode = (brightness_mode or "auto").lower()
-        self._brightness_mode = mode if mode in ("auto", "rgb", "native") else "auto"
+        # Build the stack (order matters -- §8.1): protocol -> state -> transport
+        # -> device, all BEFORE any external code assigns the 8 private attrs.
+        #
+        # device_name_getter uses getattr (not attribute access) so an early call
+        # -- or a future reorder -- degrades to None instead of raising, because
+        # _transport is assigned two lines later (LOW-7). It is only actually
+        # invoked at detect_model() below, after _transport exists.
+        self._protocol = ElkProtocol(
+            hass,
+            device_name_getter=lambda: getattr(getattr(self, "_transport", None), "name", None),
+            forced_model=forced_model,
+        )
+        self._state = ElkState()
+        # Grabs asyncio.get_running_loop() + runs the discovery scan; raises
+        # ConfigEntryNotReady when no connectable device is found (§4.1).
+        self._transport = BLETransport(address, hass, delay, protocol=self._protocol)
+        # Eager, synchronous pre-connect model resolution (god object elkbledom.py:214)
+        # so entities can probe capabilities on model/model_name at their own
+        # __init__, before any connect (§4.1 / §4.4).
+        self._protocol.detect_model()
+        self._device = ElkDevice(self._transport, self._protocol, self._state, brightness_mode)
 
+        LOGGER.debug(
+            'Model information for device %s : ModelNo %s, Turn on cmd %s, Turn off cmd %s, rssi %s',
+            self.name, self.model_name,
+            self.model.get_turn_on_cmd(self.model_name),
+            self.model.get_turn_off_cmd(self.model_name),
+            self.rssi,
+        )
 
-        try:
-            # connectable=True: we need a link we can actually open (via a proxy or
-            # a local adapter), not just an advertisement-only device.
-            self._device = async_ble_device_from_address(hass, self._address, connectable=True)
-        except (Exception) as error:
-            LOGGER.error("Error getting device: %s", error)
-
-        for discovery_info in async_discovered_service_info(hass):
-            if discovery_info.address == address:
-                devicedata = DeviceData(hass, discovery_info)
-                #LOGGER.debug("device %s: %s %s",devicedata.name, devicedata.address, devicedata.rssi)
-                if devicedata.is_supported:
-                    self._device_data = devicedata
-        
-        if not self._device:
-            raise ConfigEntryNotReady(f"You need to add bluetooth integration (https://www.home-assistant.io/integrations/bluetooth) or couldn't find a nearby device with address: {address}")
-            
-        # self._adv_data: AdvertisementData | None = None
-        self._detect_model()
-        LOGGER.debug('Model information for device %s : ModelNo %s, Turn on cmd %s, Turn off cmd %s, rssi %s', 
-                     self._device.name, self._model_name, 
-                     self._model.get_turn_on_cmd(self._model_name), 
-                     self._model.get_turn_off_cmd(self._model_name), 
-                     self.rssi)
-        
-    def _detect_model(self, char_handle: Optional[int] = None):
-        """Detect the model using Model manager.
-        
-        Args:
-            char_handle: Optional characteristic handle for refined detection
-        """
-        if not hasattr(self, '_model') or self._model is None:
-            self._model = Model(self._hass)
-        
-        # Use forced model if provided, otherwise auto-detect
-        if self._forced_model:
-            self._model_name = self._forced_model
-            LOGGER.info("%s: Using forced model: %s", self._device.name, self._forced_model)
-        elif char_handle is not None:
-            # Use handle-based detection when available
-            detected = self._model.detect_model_by_handle(self._device.name or "", char_handle)
-            if detected:
-                if hasattr(self, '_model_name') and self._model_name and detected != self._model_name:
-                    LOGGER.info("%s: Model refined from '%s' to '%s' based on handle 0x%04x", 
-                               self._device.name, self._model_name, detected, char_handle)
-                self._model_name = detected
-            else:
-                LOGGER.warning("Unknown model for device %s with handle 0x%04x", self._device.name, char_handle)
-                self._model_name = "ELK-BLEDOM"  # Default fallback
-        else:
-            # Standard name-based detection
-            self._model_name = self._model.detect_model(self._device.name or "")
-            LOGGER.debug("%s: Auto-detected model: %s", self._device.name, self._model_name)
-        
-        if not self._model_name:
-            LOGGER.warning("Unknown model for device %s", self._device.name)
-            self._model_name = "ELK-BLEDOM"  # Default fallback
-    
-    async def apply_brightness_mode(self, mode: str) -> None:
-        """Apply new brightness mode and reconnect if needed."""
-        mode = (mode or "auto").lower()
-        if mode not in ("auto", "rgb", "native"):
-            mode = "auto"
-        if mode == self._brightness_mode:
-            return
-        self._brightness_mode = mode
-        LOGGER.info("%s: Brightness mode changed to: %s", self.name, mode)
-
-    def get_color_base(self):
-        return self._rgb_color_base
-
-    def register_callback(self, callback_fn: Callable[[], None]) -> Callable[[], None]:
-        """Register an entity state-update callback; returns an unregister fn.
-
-        Entities register ``self.async_write_ha_state`` so an availability change
-        or a mic-mode transition pushes fresh state to HA without polling.
-        """
-        def unregister() -> None:
-            if callback_fn in self._callbacks:
-                self._callbacks.remove(callback_fn)
-        self._callbacks.append(callback_fn)
-        return unregister
-
-    def _fire_callbacks(self) -> None:
-        """Notify every registered entity to refresh its state."""
-        for cb in list(self._callbacks):
-            cb()
-
-    @property
-    def available(self) -> bool:
-        """Whether the strip is reachable (advertising, connected, or recently so)."""
-        return self._available
-
-    def _set_available(self, available: bool) -> None:
-        """Flip availability and push it to entities only on a real change."""
-        if available == self._available:
-            return
-        self._available = available
-        LOGGER.debug("%s: availability -> %s", self.name, "available" if available else "unavailable")
-        self._fire_callbacks()
-
-    @callback
-    def _async_update_ble(self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange) -> None:
-        """Refresh the connectable BLEDevice + RSSI from a live advertisement.
-
-        Keeps ``self._device`` current so (re)connects target the present best
-        path (the canonical HA BLE pattern), and treats a fresh advertisement as
-        proof the strip is reachable.
-        """
-        self._device = service_info.device
-        self._rssi_latest = service_info.rssi
-        self._set_available(True)
-
-    @callback
-    def _async_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
-        """Mark unavailable when the strip stops advertising.
-
-        Guarded by the live connection: a strip we hold a link to may stop
-        advertising, so the "gone" signal is ignored while connected. When the
-        link later drops or a command fails after retries, availability flips
-        through those paths instead (avoids flapping on a busy single radio).
-        """
-        if self._client and self._client.is_connected:
-            return
-        self._set_available(False)
-
-    async def _write(self, data: bytearray):
-        """Send command to device and read response."""
-        if not data:
-            return
-        # Serialize the connect+write as one unit so overlapping commands to the
-        # same device can't interleave, and the idle-disconnect can't run between
-        # _ensure_connected() and the actual write (which would null out _client).
-        async with self._operation_lock:
-            await self._ensure_connected()
-            await self._write_while_connected(data)
-
-    async def _write_while_connected(self, data: bytearray):
-        # Pace consecutive frames: these strips drop a write that arrives too
-        # soon after the previous one. Only delays when commands are bunched
-        # (a lone command after idle finds the gap already elapsed).
-        if self._last_write_at is not None:
-            gap = COMMAND_GAP - (self.loop.time() - self._last_write_at)
-            if gap > 0:
-                await asyncio.sleep(gap)
-        LOGGER.debug(''.join(format(x, ' 03x') for x in data))
-        await self._client.write_gatt_char(self._write_uuid, data, False)
-        self._last_write_at = self.loop.time()
-        # A successful write proves the strip is reachable even when it isn't
-        # advertising (e.g. while we hold the connection).
-        self._set_available(True)
-
-    async def _write_many(self, *data_items) -> None:
-        """Send several commands under a single lock acquisition so a paired
-        sequence (e.g. color-temp + white) lands atomically and can't be
-        interleaved by a competing command on the same device. Falsy items
-        (empty/None commands) are skipped."""
-        items = [d for d in data_items if d]
-        if not items:
-            return
-        async with self._operation_lock:
-            await self._ensure_connected()
-            for data in items:
-                await self._write_while_connected(data)
-
-    async def _exit_mic_mode(self) -> None:
-        """Leave music/mic mode before issuing a normal display command.
-
-        The strip stays in music mode -- ignoring color, brightness, effect and
-        speed -- until it receives the mic-power-off frame. There is no dedicated
-        "exit" opcode; the vendor app's mic toggle sends 7E 04 07 00 FF FF FF 00
-        EF, and the strip then accepts the next normal frame. We only send it
-        when we believe mic mode is active, so ordinary commands aren't doubled.
-        A short settle lets the firmware finish switching modes before the
-        caller's frame lands (sent too quickly, the strip drops it and stays
-        stuck -- the symptom this fixes).
-        """
-        if not self._mic_enabled:
-            return
-        LOGGER.debug("%s: Exiting mic/music mode before normal command", self.name)
-        await self._write([0x7e, 0x04, 0x07, 0x00, 0xff, 0xff, 0xff, 0x00, 0xef])
-        self._mic_enabled = False
-        self._fire_callbacks()
-        await asyncio.sleep(MIC_EXIT_SETTLE)
-
+    # ------------------------------------------------------------------ #
+    # Read properties: straight delegation (§4.2)                        #
+    # ------------------------------------------------------------------ #
     @property
     def address(self):
         return self._address
@@ -404,712 +124,233 @@ class BLEDOMInstance:
         return self._config_name or self.name
 
     @property
-    def brightness_mode(self):
-        return self._brightness_mode
+    def name(self):
+        return self._transport.name
 
     @property
-    def name(self):
-        return self._device.name
+    def available(self) -> bool:
+        return self._transport.available
 
     @property
     def rssi(self):
-        if self._rssi_latest is not None:
-            return self._rssi_latest
-        return 0 if self._device_data is None else self._device_data.rssi
+        return self._transport.rssi
 
     @property
+    def brightness_mode(self):
+        return self._device.brightness_mode
+
+    @property
+    def model(self):
+        return self._protocol.model
+
+    @property
+    def model_name(self):
+        return self._protocol.model_name
+
+    @property
+    def min_color_temp_kelvin(self):
+        return self._device.min_color_temp_kelvin
+
+    @property
+    def max_color_temp_kelvin(self):
+        return self._device.max_color_temp_kelvin
+
+    # ---- public read getters backed by ElkState (§4.2) ----
+    @property
     def is_on(self):
-        return self._is_on
+        return self._state.is_on
 
     @property
     def rgb_color(self):
-        return self._rgb_color
+        return self._state.rgb_color
 
     @property
     def brightness(self):
-        return self._brightness
-    
-    @property
-    def min_color_temp_kelvin(self):
-        return self._model.get_min_color_temp_kelvin(self._model_name)
-    
-    @property
-    def max_color_temp_kelvin(self):
-        return self._model.get_max_color_temp_kelvin(self._model_name)
-    
+        return self._state.brightness
+
     @property
     def color_temp_kelvin(self):
-        return self._color_temp_kelvin
-
+        return self._state.color_temp_kelvin
 
     @property
     def effect(self):
-        return self._effect
-    
+        return self._state.effect
+
     @property
     def effect_speed(self):
-        return self._effect_speed
-    
+        return self._state.effect_speed
+
     @property
     def mic_effect(self):
-        return self._mic_effect
-    
+        return self._state.mic_effect
+
     @property
     def mic_sensitivity(self):
-        return self._mic_sensitivity
-    
+        return self._state.mic_sensitivity
+
     @property
     def mic_enabled(self):
-        return self._mic_enabled
-    
-    @property
-    def model_name(self):
-        return self._model_name
-    
-    @property
-    def model(self):
-        return self._model
-    
-    @retry_bluetooth_connection_error
+        return self._state.mic_enabled
+
+    # ------------------------------------------------------------------ #
+    # Async intents: straight delegation to ElkDevice (§4.3)             #
+    # ------------------------------------------------------------------ #
+    async def apply_brightness_mode(self, mode: str) -> None:
+        return await self._device.apply_brightness_mode(mode)
+
     async def set_color_temp(self, value: int) -> None:
-        if value > 100:
-            value = 100
-        warm = value
-        cold = 100 - value
-        color_temp_cmd = self._model.get_color_temp_cmd(self._model_name, warm, cold)
-        await self._write(color_temp_cmd)
-        self._color_temp = warm
+        return await self._device.set_color_temp(value)
 
-    @retry_bluetooth_connection_error
     async def set_color_temp_kelvin(self, value: int, brightness: int) -> None:
-        # White colours are represented by colour temperature percentage from 0x0 to 0x64 from warm to cool
-        # Warm (0x0) is only the warm white LED, cool (0x64) is only the white LED and then a mixture between the two
-        await self._exit_mic_mode()
-        min_temp = self._model.get_min_color_temp_kelvin(self._model_name)
-        max_temp = self._model.get_max_color_temp_kelvin(self._model_name)
-        if value < min_temp:
-            value = min_temp
-        if value > max_temp:
-            value = max_temp
+        return await self._device.set_color_temp_kelvin(value, brightness)
 
-        # Ensure brightness is not None before using it
-        if brightness is None:
-            brightness = self._brightness if self._brightness is not None else 255
+    async def set_color(self, rgb, is_base_color: bool = False) -> None:
+        return await self._device.set_color(rgb, is_base_color)
 
-        # Clamp t to [0, 1]: 0 = warmest (min_temp), 1 = coolest (max_temp)
-        t = (value - min_temp) / (max_temp - min_temp) if max_temp > min_temp else 1.0
-
-        # Convert kelvin → warm/cold percentages (0-100):
-        # warm=100/cold=0 at min_temp (warmest), warm=0/cold=100 at max_temp (coolest)
-        warm_pct = int((1.0 - t) * 100)
-        cold_pct = int(t * 100)
-        # Built once; doubles as the capability probe (empty → RGB fallback below).
-        cmd = self._model.get_color_temp_cmd(self._model_name, warm_pct, cold_pct)
-        if cmd:
-            # Set brightness via white channel if model supports it. Send both as
-            # one atomic operation so the pair can't be interleaved by another
-            # command on the same device (an empty white_cmd is skipped).
-            white_cmd = self._model.get_white_cmd(self._model_name, brightness)
-            await self._write_many(cmd, white_cmd)
-            # Cache only after the write succeeds, and brightness only if it was
-            # actually transmitted (no white command -> nothing applied it).
-            self._color_temp_kelvin = value
-            if white_cmd:
-                self._brightness = brightness
-            else:
-                LOGGER.debug("%s: Model has no white command; brightness not sent with color temp", self.name)
-            return
-
-        # Fallback: RGB emulation for models without native color_temp command
-        warm = (255, 138, 18)   # Warm white ~1800K
-        cool = (180, 220, 255)  # Cool white ~7000K
-
-        r = int(warm[0] + (cool[0] - warm[0]) * t)
-        g = int(warm[1] + (cool[1] - warm[1]) * t)
-        b = int(warm[2] + (cool[2] - warm[2]) * t)
-
-        # Apply brightness scaling
-        scale = brightness / 255.0
-        r_scaled, g_scaled, b_scaled = int(r * scale), int(g * scale), int(b * scale)
-
-        # Write directly (not via the @retry-decorated set_color) so this method's
-        # own @retry doesn't nest with set_color's; cache only after success.
-        color_cmd = self._model.get_color_cmd(self._model_name, r_scaled, g_scaled, b_scaled)
-        await self._write(color_cmd)
-        self._rgb_color = (r_scaled, g_scaled, b_scaled)
-        self._rgb_color_base = (r, g, b)  # unscaled base for future brightness changes
-        self._color_temp_kelvin = value
-        self._brightness = brightness
-
-    @retry_bluetooth_connection_error
-    async def set_color(self, rgb: Tuple[int, int, int], is_base_color: bool = False) -> None:
-        await self._exit_mic_mode()
-        r, g, b = rgb
-        color_cmd = self._model.get_color_cmd(self._model_name, r, g, b)
-        if not color_cmd:
-            # White/temp-only models have no color command; don't pollute the
-            # cached RGB state with a write that never happened.
-            LOGGER.debug("%s: Model has no color command; ignoring set_color(%s)", self.name, rgb)
-            return
-        await self._write(color_cmd)
-        self._rgb_color = rgb
-        # If this is a base color (not brightness-scaled), save it
-        if is_base_color:
-            self._rgb_color_base = rgb
-
-    @retry_bluetooth_connection_error
     async def set_white(self, intensity: int) -> None:
-        await self._exit_mic_mode()
-        if intensity is None:
-            intensity = 255  # Valor por defecto si no se especifica
-        white_cmd = self._model.get_white_cmd(self._model_name, intensity)
-        await self._write(white_cmd)
-        self._brightness = intensity
+        return await self._device.set_white(intensity)
 
-    @retry_bluetooth_connection_error
     async def set_brightness(self, intensity: int) -> None:
-        """Set brightness with configurable mode (auto/rgb/native)."""
-        await self._exit_mic_mode()
-        value = max(1, min(int(intensity), 255))
-        percent = round(value * 100 / 255)  # logging only; commands scale internally
-        mode = (self._brightness_mode or "auto").lower()
+        return await self._device.set_brightness(intensity)
 
-        # ALWAYS scale from the base RGB color (not the already-scaled color) to
-        # avoid cumulative scaling.
-        r, g, b = self._rgb_color_base
-        # Built once: the native-mode payload and the auto-mode capability probe.
-        # get_brightness_cmd converts 0-255 -> 0-100 internally (same as
-        # get_white_cmd); passing an already-converted percent double-scales.
-        native_cmd = self._model.get_brightness_cmd(self._model_name, value)
-        has_rgb = bool(self._model.get_color_cmd(self._model_name, 255, 255, 255))
-
-        async def write_rgb_scaled():
-            """Scale RGB from the base color and write it directly (not via the
-            @retry-decorated set_color) to avoid nested retry amplification."""
-            scale = value / 255.0
-            rr, gg, bb = int(r * scale), int(g * scale), int(b * scale)
-            color_cmd = self._model.get_color_cmd(self._model_name, rr, gg, bb)
-            await self._write(color_cmd)
-            self._rgb_color = (rr, gg, bb)  # scaled; the base color is preserved
-            LOGGER.debug("%s: Brightness set via RGB scaling: %d%% (Base RGB: %d,%d,%d -> Scaled: %d,%d,%d)", self.name, percent, r, g, b, rr, gg, bb)
-
-        async def write_native():
-            """Send the model's native brightness command."""
-            await self._write(native_cmd)
-            LOGGER.debug("%s: Brightness set via native command: %d%%", self.name, percent)
-
-        # NOTE: exceptions are intentionally NOT swallowed here -- they propagate
-        # to @retry_bluetooth_connection_error so a transient BLE failure is
-        # retried instead of being logged and falsely reported to HA as success.
-        if mode == "rgb":
-            if not has_rgb:
-                LOGGER.debug("%s: No RGB color command available; brightness not applied", self.name)
-                return
-            await write_rgb_scaled()
-        elif mode == "native":
-            if not native_cmd:
-                LOGGER.debug("%s: No native brightness command available; brightness not applied", self.name)
-                return
-            await write_native()
-        else:  # auto
-            # Prefer native, but fall back to RGB scaling when the model has no
-            # native brightness command (an empty command is a silent no-op, not
-            # an exception) or when the native write fails.
-            if native_cmd:
-                try:
-                    await write_native()
-                except Exception as e:
-                    if not has_rgb:
-                        raise
-                    LOGGER.warning("%s: Native brightness failed, fallback to RGB: %s", self.name, e)
-                    await write_rgb_scaled()
-            elif has_rgb:
-                await write_rgb_scaled()
-            else:
-                LOGGER.debug("%s: No native brightness or RGB command available; brightness not applied", self.name)
-                return
-        # Cache only after a successful write so a failed command never leaves
-        # the reported brightness ahead of the device.
-        self._brightness = value
-            
-    @retry_bluetooth_connection_error
     async def set_effect_speed(self, value: int) -> None:
-        # Device speed is a 0-100 percent; clamp so an out-of-range value (e.g. a
-        # restored 0-255 value from before this range fix) isn't sent verbatim.
-        value = max(0, min(int(value), 100))
-        effect_speed = self._model.get_effect_speed_cmd(self._model_name, value)
-        await self._write(effect_speed)
-        self._effect_speed = value
+        return await self._device.set_effect_speed(value)
 
-    @retry_bluetooth_connection_error
     async def set_effect(self, value: int) -> None:
-        await self._exit_mic_mode()
-        effect = self._model.get_effect_cmd(self._model_name, value)
-        await self._write(effect)
-        self._effect = value
+        return await self._device.set_effect(value)
 
-    @retry_bluetooth_connection_error
     async def set_mic_effect(self, value: int) -> None:
-        """Set the microphone EQ mode (music-reactive).
+        return await self._device.set_mic_effect(value)
 
-        ELK/DOM strips expose 4 EQ modes (0x80-0x83); only MELK/MODELX widen to
-        8 (0x80-0x87). The vendor app clamps the value to the model's range, so
-        we do the same instead of sending an out-of-range byte to a DOM strip.
-        Selecting an EQ puts the strip in music mode, so we record that here; the
-        next normal command then knows to send an explicit mic-off first.
-        """
-        name = (self._device.name or "").lower()
-        max_effect = 0x87 if name.startswith(("melk", "modelx")) else 0x83
-        value = min(max(int(value), 0x80), max_effect)
-        await self._write([0x7e, 0x05, 0x03, value, 0x04, 0xff, 0xff, 0x00, 0xef])
-        self._mic_effect = value
-        self._mic_enabled = True
-        self._fire_callbacks()
-        LOGGER.debug("Mic effect set to: 0x%02x", value)
-
-    @retry_bluetooth_connection_error
     async def set_mic_sensitivity(self, value: int) -> None:
-        """Set microphone sensitivity (0-100)."""
-        if not 0 <= value <= 100:
-            LOGGER.warning("Invalid mic sensitivity value: %d, must be between 0 and 100", value)
-            return
-        await self._write([0x7e, 0x04, 0x06, value, 0xff, 0xff, 0xff, 0x00, 0xef])
-        self._mic_sensitivity = value
-        LOGGER.debug("Mic sensitivity set to: %d", value)
+        return await self._device.set_mic_sensitivity(value)
 
-    @retry_bluetooth_connection_error
     async def enable_mic(self) -> None:
-        """Enable external microphone."""
-        await self._write([0x7e, 0x04, 0x07, 0x01, 0xff, 0xff, 0xff, 0x00, 0xef])
-        self._mic_enabled = True
-        self._fire_callbacks()
-        LOGGER.debug("External microphone enabled")
+        return await self._device.enable_mic()
 
-    @retry_bluetooth_connection_error
     async def disable_mic(self) -> None:
-        """Disable external microphone (manual exit from music mode).
+        return await self._device.disable_mic()
 
-        Same frame as the automatic exit in _exit_mic_mode; the settle keeps a
-        color/effect command issued right after the toggle from arriving before
-        the strip has left music mode.
-        """
-        await self._write([0x7e, 0x04, 0x07, 0x00, 0xff, 0xff, 0xff, 0x00, 0xef])
-        self._mic_enabled = False
-        self._fire_callbacks()
-        await asyncio.sleep(MIC_EXIT_SETTLE)
-        LOGGER.debug("External microphone disabled")
-
-    @retry_bluetooth_connection_error
     async def turn_on(self) -> None:
-        cmd = self._model.get_turn_on_cmd(self._model_name)
-        await self._write(cmd)
-        self._is_on = True
+        return await self._device.turn_on()
 
-    @retry_bluetooth_connection_error
     async def turn_off(self) -> None:
-        cmd = self._model.get_turn_off_cmd(self._model_name)
-        await self._write(cmd)
-        self._is_on = False
+        return await self._device.turn_off()
 
-    @retry_bluetooth_connection_error
     async def set_scheduler_on(self, days: int, hours: int, minutes: int, enabled: bool) -> None:
-        if enabled:
-            value = days + 0x80
-        else:
-            value = days
-        # byte[1]=0x08 (frame length), byte[6]=0x00 selects the ON timer,
-        # byte[7] bit7 (0x80) = timer enabled.
-        await self._write([0x7e, 0x08, 0x82, hours, minutes, 0x00, 0x00, value, 0xef])
+        return await self._device.set_scheduler_on(days, hours, minutes, enabled)
 
-    @retry_bluetooth_connection_error
     async def set_scheduler_off(self, days: int, hours: int, minutes: int, enabled: bool) -> None:
-        if enabled:
-            value = days + 0x80
-        else:
-            value = days
-        # Same frame as the ON timer but byte[6]=0x01 selects the OFF timer.
-        await self._write([0x7e, 0x08, 0x82, hours, minutes, 0x00, 0x01, value, 0xef])
+        return await self._device.set_scheduler_off(days, hours, minutes, enabled)
 
-    @retry_bluetooth_connection_error
     async def sync_time(self) -> None:
-        date = datetime.date.today()
-        # The strip's weekday byte is Sunday-based (Sun=0 .. Sat=6), matching
-        # the app's Calendar.DAY_OF_WEEK-1. isoweekday() is Mon=1..Sun=7, so
-        # mod 7 maps Sun(7)->0 and leaves Mon..Sat as 1..6.
-        day_of_week = date.isoweekday() % 7
-        now = datetime.datetime.now()
-        cmd = self._model.get_sync_time_cmd(
-            self._model_name,
-            int(now.strftime('%H')),
-            int(now.strftime('%M')),
-            int(now.strftime('%S')),
-            day_of_week
-        )
-        await self._write(cmd)
+        return await self._device.sync_time()
 
-    @retry_bluetooth_connection_error
     async def custom_time(self, hour: int, minute: int, second: int, day_of_week: int) -> None:
-        cmd = self._model.get_custom_time_cmd(self._model_name, hour, minute, second, day_of_week)
-        await self._write(cmd)
+        return await self._device.custom_time(hour, minute, second, day_of_week)
+
+    async def update(self) -> None:
+        return await self._device.update()
 
     async def query_state(self) -> None:
-        """Query device state using model-specific command."""
-        if not self._client or not self._client.is_connected:
-            return
-        
-        query_cmd = self._model.get_query_cmd(self._model_name)
-        if query_cmd:
-            try:
-                LOGGER.debug("%s: Querying state with model command", self.name)
-                # Route through _write so the operation lock is held (matches every
-                # other command); _write_while_connected would bypass it.
-                await self._write(query_cmd)
-                await asyncio.sleep(0.2)
-            except Exception as e:
-                LOGGER.debug("%s: Query command failed: %s", self.name, e)
+        return await self._device.query_state()
 
-    @retry_bluetooth_connection_error
-    async def update(self) -> None:
-        try:
-            # PROBLEMS WITH STATUS VALUE, I HAVE NOT VALUE TO WRITE AND GET STATUS
-            # Seed unknown state BEFORE attempting to connect so a failed first
-            # connect (re-raised below and retried) still leaves the entity
-            # available and reporting OFF rather than permanently unavailable.
-            if(self._is_on is None):
-                self._is_on = False
-                self._rgb_color = (0, 0, 0)
-                self._color_temp_kelvin = 5000
-                self._brightness = 255
-
-            async with self._operation_lock:
-                await self._ensure_connected()
-
-            # Query device state
-            # if self._read_uuid and self._client and self._client.is_connected:
-            #     try:
-            #         await self.query_state()
-            #     except Exception as e:
-            #         LOGGER.debug("%s: Could not query state: %s", self.name, e)
-
-            if self._device_data is not None:
-                self._device_data.update_device()
-            #future = asyncio.get_event_loop().create_future()
-            #await self._device.start_notify(self._read_uuid, create_status_callback(future))
-            #await self._write([0x7e, 0x00, 0x01, 0xfa, 0x00, 0x00, 0x00, 0x00, 0xef])
-            #await self._write([0x7e, 0x00, 0x10])
-            #await self._write([0xef, 0x01, 0x77])
-            #await self._write([0x10])
-            #await self._write([0x25, 0x00])
-            #await self._write([0x25, 0x02])
-            #await asyncio.wait_for(future, 5.0)
-            #await self._device.stop_notify(self._read_uuid)
-            #res = future.result()
-            #self._is_on = True #if res[2] == 0x23 else False if res[2] == 0x24 else None
-            # self._rgb_color = (res[6], res[7], res[8])
-            # self._brightness = res[9] if res[9] > 0 else None
-            # LOGGER.debug(''.join(format(x, ' 03x') for x in res))
-            
-        except BLEAK_EXCEPTIONS:
-            # Transient BLE error: re-raise so @retry_bluetooth_connection_error
-            # retries it instead of silently flipping the reported state to OFF.
-            raise
-        except (Exception) as error:
-            self._is_on = False
-            LOGGER.error("Error getting status: %s", error)
-            track = traceback.format_exc()
-            LOGGER.debug(track)
-        
-    async def _ensure_connected(self) -> None:
-        """Ensure connection to device is established."""
-        if self._connect_lock.locked():
-            LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete; RSSI: %s",
-                self.name,
-                self.rssi,
-            )
-        if self._client and self._client.is_connected:
-            self._reset_disconnect_timer()
-            return
-        async with self._connect_lock:
-            # Check again while holding the lock
-            if self._client and self._client.is_connected:
-                self._reset_disconnect_timer()
-                return
-
-            LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
-            try:
-                client = await establish_connection(
-                        BleakClientWithServiceCache,
-                        self._device,
-                        self.name,
-                        self._disconnected,
-                        cached_services=self._cached_services,
-                        # Re-query HA for the freshest connectable device each
-                        # attempt (falling back to the last known one) so the
-                        # retry connector can pick the current best proxy path
-                        # instead of a device frozen at setup time.
-                        ble_device_callback=lambda: (
-                            async_ble_device_from_address(self._hass, self._address, connectable=True)
-                            or self._device
-                        ),
-                        # One connect attempt here; the outer
-                        # @retry_bluetooth_connection_error owns the retry budget
-                        # so the two layers don't multiply into a long, radio-
-                        # hogging storm under the operation lock.
-                        max_attempts=1,
-                    )
-            except asyncio.TimeoutError:
-                # Re-raise rather than return: returning leaves self._client None
-                # and the caller's _write_while_connected then dereferences None
-                # (uncaught AttributeError). Raising lets @retry handle/retry it.
-                LOGGER.error("%s: Connection attempt timed out; RSSI: %s", self.name, self.rssi)
-                raise
-
-            LOGGER.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
-            
-            # Execute login command BEFORE resolving characteristics for MELK/MODELX devices
-            # These devices disconnect if login is not performed first
-            if self._device.name.lower().startswith("melk") or self._device.name.lower().startswith("modelx"):
-                LOGGER.debug("%s: Executing login procedure before service discovery; RSSI: %s", self.name, self.rssi)
-                try:
-                    # Get services to find write UUID for login
-                    temp_services = None
-                    try:
-                        temp_services = client.services
-                    except (AttributeError, Exception):
-                        try:
-                            temp_services = await client.get_services()
-                        except (AttributeError, Exception) as e:
-                            LOGGER.error("%s: Failed to get services: %s", self.name, e)
-                            raise
-                    
-                    temp_write_uuid = None
-                    
-                    # Find write characteristic for login
-                    write_uuid = self._model.get_write_uuid(self._model_name)
-                    if write_uuid and (char := temp_services.get_characteristic(write_uuid)):
-                        temp_write_uuid = str(char.uuid)  # Ensure it's a string
-                        LOGGER.debug("%s: Found write UUID for login: %s", self.name, temp_write_uuid)
-                    
-                    if temp_write_uuid:
-                        LOGGER.info("%s: Executing login sequence...", self.name)
-                        await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x07, 0x83]), response=False)
-                        await asyncio.sleep(LOGIN_STEP_DELAY)
-                        await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x04, 0x04]), response=False)
-                        await asyncio.sleep(LOGIN_STEP_DELAY)
-                        LOGGER.info("%s: Login sequence completed", self.name)
-                    else:
-                        LOGGER.warning("%s: Could not find write UUID for login procedure", self.name)
-                except Exception as e:
-                    LOGGER.error("%s: Login procedure failed: %s", self.name, e)
-                    # Continue anyway, might work for some devices
-            
-            # Try to get services with fallback
-            services_obj = None
-            try:
-                services_obj = client.services
-            except (AttributeError, Exception):
-                try:
-                    services_obj = await client.get_services()
-                except (AttributeError, Exception) as e:
-                    LOGGER.error("%s: Failed to get services: %s", self.name, e)
-                    await client.disconnect()
-                    raise
-            
-            resolved = self._resolve_characteristics(services_obj)
-            if not resolved:
-                # Try to handle services failing to load
-                try:
-                    # Try alternate method
-                    alt_services = None
-                    try:
-                        alt_services = await client.get_services()
-                    except (AttributeError, Exception):
-                        try:
-                            alt_services = client.services
-                        except (AttributeError, Exception) as e:
-                            LOGGER.warning("%s: Could not get services with either method: %s", self.name, e)
-                            raise
-                    
-                    if alt_services:
-                        resolved = self._resolve_characteristics(alt_services)
-                        self._cached_services = alt_services if resolved else None
-                except (AttributeError, Exception) as error:
-                    LOGGER.warning("%s: Could not resolve characteristics from services; RSSI: %s", self.name, self.rssi)
-            else:
-                self._cached_services = services_obj if resolved else None
-            
-            if not resolved:
-                await client.clear_cache()
-                await client.disconnect()
-                raise CharacteristicMissingError(
-                    "Failed to find supported characteristics, device may not be supported"
-                )
-
-            LOGGER.debug("%s: Characteristics resolved: %s; RSSI: %s", self.name, resolved, self.rssi)
-
-            self._client = client
-            self._set_available(True)
-            self._reset_disconnect_timer()
-
-            # Enable notifications (simple method, no manual CCCD)
-            try:
-                if not self._device.name.lower().startswith("melk") and not self._device.name.lower().startswith("ledble"):
-                    if self._read_uuid is not None and isinstance(self._read_uuid, str) and self._read_uuid.lower() != "none":
-                        LOGGER.debug("%s: Enabling notifications; RSSI: %s", self.name, self.rssi)
-                        await client.start_notify(self._read_uuid, self._notification_handler)
-                        LOGGER.info("%s: Notifications enabled", self.name)
-                    else:
-                        LOGGER.warning("%s: Read UUID not resolved (value: %s), skipping notifications", self.name, self._read_uuid)
-            except Exception as e:
-                LOGGER.warning("%s: Notifications could not be enabled: %s", self.name, e)
-
-
-
-    def _notification_handler(self, _sender: int, data: bytearray) -> None:
-        """Handle notification data from the device.
-
-        These ELK-BLE* strips echo every command we write back on the notify
-        characteristic; they do not emit reliable status frames. The echoed
-        brightness/white command (7e 04 01 <i> ff 00 ff 00 ef) has 0x01 at
-        byte[2], so the previous parser mistook it for a status reply and read
-        bytes 4-6 (ff 00 ff) as RGB magenta and byte[7] (0x00) as 0% brightness
-        -- corrupting state so every colour change reported magenta and dropped
-        brightness to zero. The command methods are the source of truth for
-        power/colour/brightness, so we only log here and never overwrite state
-        from these echoes.
-        """
-        self._notification_received = True
-        LOGGER.debug("%s: Notification (command echo) received (%d bytes): %s", self.name, len(data), ' '.join(f'{x:02x}' for x in data))
-        return
-
-    def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
-        """Resolve characteristics."""
-        if not services:
-            LOGGER.debug("%s: No services provided to resolve characteristics, dont should works", self.name)
-        
-        # Log all available characteristics for debugging
-        LOGGER.debug("%s: Available services and characteristics:", self.name)
-        for service in services:
-            LOGGER.debug("%s: Service %s", self.name, service.uuid)
-            for char in service.characteristics:
-                LOGGER.debug("%s:   Characteristic %s (properties: %s)", self.name, char.uuid, char.properties)
-        
-        # Try to find read characteristic
-        read_uuid = self._model.get_read_uuid(self._model_name)
-        if read_uuid and (char := services.get_characteristic(read_uuid)):
-            self._read_uuid = str(char.uuid)  # Ensure it's a string
-            LOGGER.debug("%s: Found read UUID: %s with handle %s", self.name, self._read_uuid, char.handle if hasattr(char, 'handle') else 'Unknown')
-        else:
-            self._read_uuid = None
-            LOGGER.warning("%s: Could not find read characteristic: %s", self.name, read_uuid)
-        
-        # Try to find write characteristic
-        write_uuid = self._model.get_write_uuid(self._model_name)
-        if write_uuid and (char := services.get_characteristic(write_uuid)):
-            self._write_uuid = str(char.uuid)  # Ensure it's a string
-            char_handle = char.handle if hasattr(char, 'handle') else None
-            LOGGER.debug("%s: Found write UUID: %s with handle %s", self.name, self._write_uuid, f"0x{char_handle:04x}" if char_handle else 'Unknown')
-            
-            # Re-detect model based on handle if available
-            if char_handle is not None:
-                self._detect_model(char_handle)
-                # Update write_uuid in case model changed
-                write_uuid = self._model.get_write_uuid(self._model_name)
-                if write_uuid:
-                    self._write_uuid = str(write_uuid)
-        else:
-            self._write_uuid = None
-            LOGGER.error("%s: Could not find write characteristic: %s", self.name, write_uuid)
-        
-        # For devices like MELK that don't use notifications, only write_uuid is required
-        if self._device.name.lower().startswith("melk") or self._device.name.lower().startswith("modelx"):
-            result = bool(self._write_uuid)
-            LOGGER.debug("%s: Device doesn't require read UUID, resolved: %s", self.name, result)
-            return result
-        
-        return bool(self._read_uuid and self._write_uuid)
-
-    def _reset_disconnect_timer(self) -> None:
-        """Reset disconnect timer."""
-        if self._disconnect_timer:
-            self._disconnect_timer.cancel()
-        self._expected_disconnect = False
-        if self._delay is not None and self._delay != 0:
-            LOGGER.debug("%s: Configured disconnect from device in %s seconds; RSSI: %s", self.name, self._delay, self.rssi)
-            self._disconnect_timer = self.loop.call_later(
-                self._delay, self._disconnect
-            )
-
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Disconnected callback."""
-        if self._expected_disconnect:
-            LOGGER.debug("%s: Disconnected from device; RSSI: %s", self.name, self.rssi)
-            return
-        LOGGER.warning("%s: Device unexpectedly disconnected; RSSI: %s",self.name,self.rssi,)
-
-    def _disconnect(self) -> None:
-        """Disconnect from device."""
-        self._disconnect_timer = None
-        # Keep a strong reference (asyncio holds only a weak one) so the task
-        # can't be garbage-collected mid-await, which would leak the connection.
-        self._disconnect_task = asyncio.create_task(self._execute_timed_disconnect())
+    def get_color_base(self):
+        return self._device.get_color_base()
 
     async def stop(self) -> None:
-        """Stop the strip and release its timers/tasks (called on unload)."""
-        LOGGER.debug("%s: Stop", self.name)
-        # Cancel the pending idle-disconnect timer so it can't fire after the
-        # instance is torn down -- otherwise a live TimerHandle bound to
-        # self._disconnect keeps the instance alive for up to `delay` seconds.
-        if self._disconnect_timer is not None:
-            self._disconnect_timer.cancel()
-            self._disconnect_timer = None
-        # Cancel/await any in-flight idle-disconnect task, but never self-await
-        # (stop() may run while a timed disconnect task is executing).
-        task = self._disconnect_task
-        self._disconnect_task = None
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                LOGGER.debug("%s: idle-disconnect task cleanup: %s", self.name, e)
-        await self._execute_disconnect()
+        return await self._transport.stop()
 
-    async def _execute_timed_disconnect(self) -> None:
-        """Execute timed disconnection."""
-        LOGGER.debug(
-            "%s: Disconnecting after timeout of %s",
-            self.name,
-            self._delay,
-        )
-        await self._execute_disconnect(timed=True)
+    # ------------------------------------------------------------------ #
+    # Callback registry + the two HA @callback shims (§4.6)              #
+    # ------------------------------------------------------------------ #
+    def register_callback(self, callback_fn):
+        """Register an entity state-update callback; returns an unregister fn."""
+        return self._transport.register_callback(callback_fn)
 
-    async def _execute_disconnect(self, timed: bool = False) -> None:
-        """Execute disconnection."""
-        # Use the operation lock (not just the connect lock) so a disconnect can
-        # never run between _ensure_connected() and the write inside _write().
-        async with self._operation_lock:
-            # For idle (timed) disconnects: if a command refreshed the connection
-            # while this was queued behind it on the lock, it re-armed the idle
-            # timer -- skip the now-stale teardown so we don't kill a connection
-            # that's actively in use (which would force an immediate reconnect).
-            if timed and self._disconnect_timer is not None:
-                LOGGER.debug("%s: Skipping stale idle disconnect; connection was refreshed", self.name)
-                return
-            read_char = self._read_uuid if hasattr(self, '_read_uuid') else None
-            client = self._client
-            LOGGER.debug("Disconnecting: READ_UUID=%s, CLIENT_CONNECTED=%s", read_char, client.is_connected if client else "No Client")
-            self._expected_disconnect = True
-            self._client = None
-            self._write_uuid = None
-            self._read_uuid = None
-            if client and client.is_connected:
-                try:
-                    if read_char and not self._device.name.lower().startswith("melk") and not self._device.name.lower().startswith("ledble"):
-                        await client.stop_notify(read_char)
-                    await client.disconnect()
-                except Exception as e:
-                    LOGGER.error("Error during disconnection: %s", e)
+    @callback
+    def _async_update_ble(self, service_info, change) -> None:
+        # __init__.py:129 captures this bound @callback at setup for teardown;
+        # keep it a real @callback method on the facade (not a lazy delegate).
+        self._transport._async_update_ble(service_info, change)
+
+    @callback
+    def _async_unavailable(self, service_info) -> None:
+        self._transport._async_unavailable(service_info)
+
+    # ------------------------------------------------------------------ #
+    # The 8 externally-written privates: data-descriptor property+setter #
+    # pairs into the shared ElkState (§4.5 / §3.5).                       #
+    #                                                                    #
+    # A ``property`` is a data descriptor (defines __get__ AND __set__),  #
+    # so it wins over the instance __dict__ for both read and write:      #
+    # ``instance._is_on = True`` (light.py:160) routes through the setter #
+    # into the SAME ElkState the device reads -- no divergence. The       #
+    # _rgb_color / _rgb_color_base coupling (light.py:186) holds because  #
+    # the getter returns state.rgb_color and the setter stores into       #
+    # state.rgb_color_base. __init__ builds _state before any external    #
+    # assignment, and none of the 8 is ever a plain instance attribute.   #
+    # ------------------------------------------------------------------ #
+    @property
+    def _is_on(self):
+        return self._state.is_on
+
+    @_is_on.setter
+    def _is_on(self, value):
+        self._state.is_on = value
+
+    @property
+    def _brightness(self):
+        return self._state.brightness
+
+    @_brightness.setter
+    def _brightness(self, value):
+        self._state.brightness = value
+
+    @property
+    def _rgb_color(self):
+        return self._state.rgb_color
+
+    @_rgb_color.setter
+    def _rgb_color(self, value):
+        self._state.rgb_color = value
+
+    @property
+    def _rgb_color_base(self):
+        return self._state.rgb_color_base
+
+    @_rgb_color_base.setter
+    def _rgb_color_base(self, value):
+        self._state.rgb_color_base = value
+
+    @property
+    def _color_temp_kelvin(self):
+        return self._state.color_temp_kelvin
+
+    @_color_temp_kelvin.setter
+    def _color_temp_kelvin(self, value):
+        self._state.color_temp_kelvin = value
+
+    @property
+    def _effect(self):
+        return self._state.effect
+
+    @_effect.setter
+    def _effect(self, value):
+        self._state.effect = value
+
+    @property
+    def _effect_speed(self):
+        return self._state.effect_speed
+
+    @_effect_speed.setter
+    def _effect_speed(self, value):
+        self._state.effect_speed = value
+
+    @property
+    def _mic_enabled(self):
+        return self._state.mic_enabled
+
+    @_mic_enabled.setter
+    def _mic_enabled(self, value):
+        self._state.mic_enabled = value
