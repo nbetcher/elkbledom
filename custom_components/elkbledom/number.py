@@ -4,7 +4,7 @@ from homeassistant.components.number import (
     NumberEntity,
 )
 
-from .elkbledom import BLEDOMInstance
+from .coordinator import ElkCoordinator
 from .entity import BLEDOMEntity
 from .const import DOMAIN
 
@@ -23,17 +23,18 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    instance = hass.data[DOMAIN][config_entry.entry_id]
-    entities = [BLEDOMMicSensitivity(instance, "Mic Sensitivity " + config_entry.data["name"], config_entry.entry_id)]
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    instance = coordinator.instance
+    entities = [BLEDOMMicSensitivity(coordinator, "Mic Sensitivity " + config_entry.data["name"], config_entry.entry_id)]
     if instance.model.get_effect_speed_cmd(instance.model_name, 50):
-        entities.append(BLEDOMEffectSpeed(instance, "Effect Speed " + config_entry.data["name"], config_entry.entry_id))
+        entities.append(BLEDOMEffectSpeed(coordinator, "Effect Speed " + config_entry.data["name"], config_entry.entry_id))
     async_add_entities(entities)
 
 class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
     """Effect Speed entity"""
 
-    def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
-        self._instance = bledomInstance
+    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry_id: str) -> None:
+        super().__init__(coordinator)
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_effect_speed"
         self._effect_speed = 0
@@ -61,7 +62,7 @@ class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""
-        await self._instance.set_effect_speed(int(value))
+        await self._device.set_effect_speed(int(value))
         self._effect_speed = int(value)
         self.async_write_ha_state()
 
@@ -80,8 +81,8 @@ class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
 class BLEDOMMicSensitivity(BLEDOMEntity, RestoreEntity, NumberEntity):
     """Microphone Sensitivity entity"""
 
-    def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
-        self._instance = bledomInstance
+    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry_id: str) -> None:
+        super().__init__(coordinator)
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_sensitivity"
         self._mic_sensitivity = 50
@@ -107,7 +108,7 @@ class BLEDOMMicSensitivity(BLEDOMEntity, RestoreEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""
-        await self._instance.set_mic_sensitivity(int(value))
+        await self._device.set_mic_sensitivity(int(value))
         self._mic_sensitivity = int(value)
 
     async def async_added_to_hass(self) -> None:

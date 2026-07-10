@@ -24,6 +24,7 @@ from .const import (
     WEEK_DAYS,
 )
 from .elkbledom import BLEDOMInstance
+from .coordinator import ElkCoordinator
 from .model import ensure_models_loaded
 import logging
 
@@ -86,15 +87,19 @@ def _entry_option(entry: ConfigEntry, key, default=None):
 
 
 def _instances_for_entities(hass: HomeAssistant, entity_ids):
-    """Resolve target entity_ids to their BLEDOMInstance objects (deduplicated)."""
+    """Resolve target entity_ids to their BLEDOMInstance objects (deduplicated).
+
+    hass.data now holds the ElkCoordinator per entry (Phase 4); unwrap to the
+    underlying instance the services call (sync_time/set_scheduler_*/address).
+    """
     ent_reg = er.async_get(hass)
     instances = {}
     for entity_id in entity_ids:
         entity_entry = ent_reg.async_get(entity_id)
         if entity_entry and entity_entry.config_entry_id:
-            instance = hass.data.get(DOMAIN, {}).get(entity_entry.config_entry_id)
-            if instance is not None:
-                instances[entity_entry.config_entry_id] = instance
+            coordinator = hass.data.get(DOMAIN, {}).get(entity_entry.config_entry_id)
+            if coordinator is not None:
+                instances[entity_entry.config_entry_id] = coordinator.instance
     return list(instances.values())
 
 
@@ -118,7 +123,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await ensure_models_loaded(hass)
 
     instance = BLEDOMInstance(entry.data[CONF_MAC], reset, delay, hass, forced_model, brightness_mode, entry.data.get("name"))
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = instance
+    # Wrap the instance in a push-only coordinator (no polling: it just
+    # re-publishes the optimistic ElkState snapshot on transport events). The
+    # first refresh returns the seeded snapshot without any BLE traffic. The
+    # coordinator (not the raw instance) is what entities/services resolve.
+    coordinator = ElkCoordinator(hass, instance)
+    await coordinator.async_config_entry_first_refresh()
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     # Keep the connectable BLEDevice fresh and drive availability from the strip's
     # advertisements (the canonical HA BLE pattern). Both registrations are torn
@@ -279,9 +290,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        instance = hass.data[DOMAIN].pop(entry.entry_id, None)
-        if instance is not None:
-            await instance.stop()
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if coordinator is not None:
+            # async_shutdown() unsubscribes from the transport, then stops the
+            # underlying instance (closes the BLE connection + cancels timers).
+            await coordinator.async_shutdown()
     return unload_ok
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -291,9 +304,10 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     A reload is triggered only when an option consumed at setup time (reset,
     delay, forced model) actually changed.
     """
-    instance = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if instance is None:
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:
         return
+    instance = coordinator.instance
 
     brightness_mode = entry.options.get(CONF_BRIGHTNESS_MODE)
     if brightness_mode:

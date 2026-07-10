@@ -6,7 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .elkbledom import BLEDOMInstance
+from .coordinator import ElkCoordinator
 from .entity import BLEDOMEntity
 from .const import DOMAIN, MIC_EFFECTS, MIC_EFFECTS_list, BRIGHTNESS_MODES, CONF_BRIGHTNESS_MODE
 
@@ -19,17 +19,17 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    instance = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
     async_add_entities([
-        BLEDOMMicEffect(instance, "Mic Effect " + config_entry.data["name"], config_entry.entry_id),
-        BLEDOMBrightnessModeSelect(instance, "Brightness Mode " + config_entry.data["name"], config_entry, config_entry.entry_id)
+        BLEDOMMicEffect(coordinator, "Mic Effect " + config_entry.data["name"], config_entry.entry_id),
+        BLEDOMBrightnessModeSelect(coordinator, "Brightness Mode " + config_entry.data["name"], config_entry, config_entry.entry_id)
     ])
 
 class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
     """Microphone Effect selector entity"""
 
-    def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry_id: str) -> None:
-        self._instance = bledomInstance
+    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry_id: str) -> None:
+        super().__init__(coordinator)
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_effect"
         self._current_option = MIC_EFFECTS_list[0]
@@ -54,7 +54,7 @@ class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
         """Change the selected option."""
         if option in self.options:
             effect_value = MIC_EFFECTS[option].value
-            await self._instance.set_mic_effect(effect_value)
+            await self._device.set_mic_effect(effect_value)
             self._current_option = option
             self.async_write_ha_state()
             LOG.debug(f"Mic effect set to {option} (0x{effect_value:02x})")
@@ -75,8 +75,8 @@ class BLEDOMMicEffect(BLEDOMEntity, RestoreEntity, SelectEntity):
 class BLEDOMBrightnessModeSelect(BLEDOMEntity, RestoreEntity, SelectEntity):
     """Brightness Mode selector entity"""
 
-    def __init__(self, bledomInstance: BLEDOMInstance, attr_name: str, entry: ConfigEntry, entry_id: str) -> None:
-        self._instance = bledomInstance
+    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry: ConfigEntry, entry_id: str) -> None:
+        super().__init__(coordinator)
         self._entry = entry
         self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_brightness_mode"
@@ -108,7 +108,7 @@ class BLEDOMBrightnessModeSelect(BLEDOMEntity, RestoreEntity, SelectEntity):
         self.hass.config_entries.async_update_entry(self._entry, options=data)
 
         # Apply mode to instance
-        await self._instance.apply_brightness_mode(option)
+        await self._device.apply_brightness_mode(option)
 
         self.async_write_ha_state()
 
@@ -126,5 +126,5 @@ class BLEDOMBrightnessModeSelect(BLEDOMEntity, RestoreEntity, SelectEntity):
 
         # Make sure the running instance actually reflects the selected mode.
         # (Setup also seeds it from the config entry; this covers the restore path.)
-        await self._instance.apply_brightness_mode(self._current_option)
+        await self._device.apply_brightness_mode(self._current_option)
 

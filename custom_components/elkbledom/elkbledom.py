@@ -12,14 +12,18 @@ The former ~1000-line god object is decomposed into cohesive layers:
                                      state, brightness-mode + mic-exit policy.
 
 ``BLEDOMInstance`` composes that stack and re-exposes the ENTIRE public surface
-the entities / ``__init__.py`` / ``config_flow.py`` depend on (see the
-compatibility contract in docs/god-object-refactor.md §4): every method delegates
-to ``ElkDevice`` / ``BLETransport``; every property reads through; and the eight
-externally-written private attributes the light/switch restore paths poke
-(``_is_on``/``_brightness``/``_rgb_color``/``_rgb_color_base``/
-``_color_temp_kelvin``/``_effect``/``_effect_speed``/``_mic_enabled``) are exposed
-as data-descriptor property+setter pairs routed into the shared ``ElkState`` (so an
-external assignment takes effect on the same state the device reads -- §4.5).
+the entities / ``__init__.py`` / ``config_flow.py`` / the ``ElkCoordinator``
+depend on (see the compatibility contract in docs/god-object-refactor.md §4):
+every method delegates to ``ElkDevice`` / ``BLETransport``; every property reads
+through.
+
+Phase 3/4 (docs/god-object-refactor.md §6): entities now reach the composed
+layers through the public ``device`` (-> ``ElkDevice``), ``state``
+(-> ``ElkState``), and ``transport`` (-> ``BLETransport``) accessors and call
+``self._instance.state.restore(...)`` instead of poking privates, so the eight
+externally-written ``_is_on``/``_brightness``/``_rgb_color``/``_rgb_color_base``/
+``_color_temp_kelvin``/``_effect``/``_effect_speed``/``_mic_enabled`` shims are
+gone.
 
 ``DeviceData`` now lives in ``device_data.py`` (to break the transport<->facade
 import cycle, §2.5) and is re-exported here so ``config_flow.py:3``
@@ -193,6 +197,25 @@ class BLEDOMInstance:
         return self._state.mic_enabled
 
     # ------------------------------------------------------------------ #
+    # Public layer accessors (Phase 3/4): entities + the ElkCoordinator  #
+    # talk to the composed stack directly instead of poking privates.    #
+    # ------------------------------------------------------------------ #
+    @property
+    def device(self):
+        """The ElkDevice (intent surface) entities call for set_color/etc."""
+        return self._device
+
+    @property
+    def state(self):
+        """The shared ElkState snapshot the coordinator pushes to entities."""
+        return self._state
+
+    @property
+    def transport(self):
+        """The BLETransport (connection/availability/callback registry)."""
+        return self._transport
+
+    # ------------------------------------------------------------------ #
     # Async intents: straight delegation to ElkDevice (§4.3)             #
     # ------------------------------------------------------------------ #
     async def apply_brightness_mode(self, mode: str) -> None:
@@ -277,80 +300,3 @@ class BLEDOMInstance:
     @callback
     def _async_unavailable(self, service_info) -> None:
         self._transport._async_unavailable(service_info)
-
-    # ------------------------------------------------------------------ #
-    # The 8 externally-written privates: data-descriptor property+setter #
-    # pairs into the shared ElkState (§4.5 / §3.5).                       #
-    #                                                                    #
-    # A ``property`` is a data descriptor (defines __get__ AND __set__),  #
-    # so it wins over the instance __dict__ for both read and write:      #
-    # ``instance._is_on = True`` (light.py:160) routes through the setter #
-    # into the SAME ElkState the device reads -- no divergence. The       #
-    # _rgb_color / _rgb_color_base coupling (light.py:186) holds because  #
-    # the getter returns state.rgb_color and the setter stores into       #
-    # state.rgb_color_base. __init__ builds _state before any external    #
-    # assignment, and none of the 8 is ever a plain instance attribute.   #
-    # ------------------------------------------------------------------ #
-    @property
-    def _is_on(self):
-        return self._state.is_on
-
-    @_is_on.setter
-    def _is_on(self, value):
-        self._state.is_on = value
-
-    @property
-    def _brightness(self):
-        return self._state.brightness
-
-    @_brightness.setter
-    def _brightness(self, value):
-        self._state.brightness = value
-
-    @property
-    def _rgb_color(self):
-        return self._state.rgb_color
-
-    @_rgb_color.setter
-    def _rgb_color(self, value):
-        self._state.rgb_color = value
-
-    @property
-    def _rgb_color_base(self):
-        return self._state.rgb_color_base
-
-    @_rgb_color_base.setter
-    def _rgb_color_base(self, value):
-        self._state.rgb_color_base = value
-
-    @property
-    def _color_temp_kelvin(self):
-        return self._state.color_temp_kelvin
-
-    @_color_temp_kelvin.setter
-    def _color_temp_kelvin(self, value):
-        self._state.color_temp_kelvin = value
-
-    @property
-    def _effect(self):
-        return self._state.effect
-
-    @_effect.setter
-    def _effect(self, value):
-        self._state.effect = value
-
-    @property
-    def _effect_speed(self):
-        return self._state.effect_speed
-
-    @_effect_speed.setter
-    def _effect_speed(self, value):
-        self._state.effect_speed = value
-
-    @property
-    def _mic_enabled(self):
-        return self._state.mic_enabled
-
-    @_mic_enabled.setter
-    def _mic_enabled(self, value):
-        self._state.mic_enabled = value

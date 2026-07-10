@@ -39,6 +39,18 @@ class ElkProtocol:
         # make the write path use the model's generic UUID and silently break handle
         # refinement (§2.4, invariants #6/#9). Do not add _read_uuid/_write_uuid here.
 
+    # ---- supported-model predicate (config-flow discovery filter) ----
+    @staticmethod
+    def is_supported(hass, name: Optional[str]) -> bool:
+        """True if the advertised BLE name resolves to a known model.
+
+        Same boolean as DeviceData's old inline check
+        (``Model(hass).detect_model(name) is not None``, device_data.py:34-36).
+        Static (takes hass) so the config-flow discovery wrapper can call it
+        without owning an ``ElkProtocol`` instance / device_name_getter.
+        """
+        return Model(hass).detect_model(name or "") is not None
+
     # ---- model indirection (from elkbledom.py:221-252) ----
     @property
     def model(self) -> Model:

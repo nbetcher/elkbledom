@@ -4,7 +4,7 @@ import logging
 import voluptuous as vol
 from typing import Any, Optional, Tuple
 
-from .elkbledom import BLEDOMInstance
+from .coordinator import ElkCoordinator
 from .entity import BLEDOMEntity
 from .const import DOMAIN, EFFECTS, EFFECTS_list, EFFECTS_MAP, EFFECTS_LIST_MAP, CONF_EFFECTS_CLASS
 
@@ -32,8 +32,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
 })
 
 async def async_setup_entry(hass, config_entry, async_add_devices) -> None:
-    instance = hass.data[DOMAIN][config_entry.entry_id]
-    async_add_devices([BLEDOMLight(instance, config_entry.data["name"], config_entry.entry_id)])
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    async_add_devices([BLEDOMLight(coordinator, config_entry.data["name"], config_entry.entry_id)])
 
 class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
     # The strip has no state readback, so reported state is optimistic. Declaring
@@ -42,8 +42,8 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
     # device).
     _attr_assumed_state = True
 
-    def __init__(self, bledomInstance: BLEDOMInstance, name: str, entry_id: str) -> None:
-        self._instance = bledomInstance
+    def __init__(self, coordinator: ElkCoordinator, name: str, entry_id: str) -> None:
+        super().__init__(coordinator)
         self._entry_id = entry_id
         has_white = bool(self._instance.model.get_white_cmd(self._instance.model_name, 255))
         has_color_temp = bool(self._instance.model.get_color_temp_cmd(self._instance.model_name, 50, 50))
@@ -157,48 +157,48 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
             
             # Restore on/off state
             if last_state.state == "on":
-                self._instance._is_on = True
+                self._instance.state.restore(is_on=True)
                 LOGGER.debug(f"Restored state: ON")
             elif last_state.state == "off":
-                self._instance._is_on = False
+                self._instance.state.restore(is_on=False)
                 LOGGER.debug(f"Restored state: OFF")
             elif last_state.state == "unavailable":
                 # If previous state was unavailable, assume device is off but available
                 # This prevents the entity from staying unavailable after restart
-                self._instance._is_on = False
+                self._instance.state.restore(is_on=False)
                 LOGGER.debug(f"Previous state was unavailable, setting to OFF")
-            
+
             # Restore brightness (guard against a saved None, which would
             # overwrite the 255 default and leak None into reported state)
             restored_brightness = last_state.attributes.get(ATTR_BRIGHTNESS)
             if restored_brightness is not None:
-                self._instance._brightness = restored_brightness
-                LOGGER.debug(f"Restored brightness: {self._instance._brightness}")
-            
+                self._instance.state.restore(brightness=restored_brightness)
+                LOGGER.debug(f"Restored brightness: {self._instance.state.brightness}")
+
             # Restore RGB color
             if ATTR_RGB_COLOR in last_state.attributes and last_state.attributes[ATTR_RGB_COLOR] is not None:
                 try:
-                    self._instance._rgb_color = tuple(last_state.attributes[ATTR_RGB_COLOR])
-                    # Also restore the unscaled base color (HA's rgb_color is the
-                    # full-scale color); without this the first brightness change
-                    # after a restart scales the default white base and the
-                    # restored color is lost (strip goes white).
-                    self._instance._rgb_color_base = self._instance._rgb_color
+                    restored_rgb = tuple(last_state.attributes[ATTR_RGB_COLOR])
+                    # couple_base=True also restores the unscaled base color (HA's
+                    # rgb_color is the full-scale color); without this the first
+                    # brightness change after a restart scales the default white
+                    # base and the restored color is lost (strip goes white).
+                    self._instance.state.restore(rgb_color=restored_rgb, couple_base=True)
                     if ColorMode.RGB in self._attr_supported_color_modes:
                         self._attr_color_mode = ColorMode.RGB
-                        LOGGER.debug(f"Restored RGB color: {self._instance._rgb_color}")
+                        LOGGER.debug(f"Restored RGB color: {self._instance.state.rgb_color}")
                     else:
                         LOGGER.debug("RGB color restored but model does not support RGB mode, ignoring color_mode")
                 except (TypeError, ValueError) as e:
                     LOGGER.warning(f"Invalid RGB color data, skipping: {e}")
-            
+
             # Restore color temperature
             elif ATTR_COLOR_TEMP_KELVIN in last_state.attributes and last_state.attributes[ATTR_COLOR_TEMP_KELVIN] is not None:
                 try:
-                    self._instance._color_temp_kelvin = last_state.attributes[ATTR_COLOR_TEMP_KELVIN]
+                    self._instance.state.restore(color_temp_kelvin=last_state.attributes[ATTR_COLOR_TEMP_KELVIN])
                     if ColorMode.COLOR_TEMP in self._attr_supported_color_modes:
                         self._attr_color_mode = ColorMode.COLOR_TEMP
-                        LOGGER.debug(f"Restored color temp: {self._instance._color_temp_kelvin}K")
+                        LOGGER.debug(f"Restored color temp: {self._instance.state.color_temp_kelvin}K")
                     else:
                         LOGGER.debug("COLOR_TEMP restored but model does not support it, ignoring color_mode")
                 except (TypeError, ValueError) as e:
@@ -221,21 +221,20 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
                     effects_class_name = self._instance.model.get_effects_class(self._instance.model_name)
                 effects_class = EFFECTS_MAP.get(effects_class_name, EFFECTS)
                 if self._attr_effect in effects_class.__members__:
-                    self._instance._effect = effects_class[self._attr_effect].value
+                    self._instance.state.restore(effect=effects_class[self._attr_effect].value)
                 LOGGER.debug(f"Restored effect: {self._attr_effect}")
-            
+
             # Restore effect speed from extra attributes
             if "effect_speed" in last_state.attributes:
                 try:
-                    self._instance._effect_speed = int(last_state.attributes["effect_speed"])
-                    LOGGER.debug(f"Restored effect speed: {self._instance._effect_speed}")
+                    self._instance.state.restore(effect_speed=int(last_state.attributes["effect_speed"]))
+                    LOGGER.debug(f"Restored effect speed: {self._instance.state.effect_speed}")
                 except (TypeError, ValueError) as e:
                     LOGGER.warning(f"Invalid effect speed data, using default: {e}")
         else:
             # No previous state found, set default values
             LOGGER.debug(f"No previous state found for {self.name}, setting defaults")
-            self._instance._is_on = False
-            self._instance._brightness = 255
+            self._instance.state.restore(is_on=False, brightness=255)
 
         # Final safety: ensure color_mode is always valid for this model
         if self._attr_color_mode not in self._attr_supported_color_modes:
@@ -254,11 +253,11 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         LOGGER.debug(f"Params turn on: {kwargs} color mode: {self._attr_color_mode}")
         if not self.is_on:
-            await self._instance.turn_on()
+            await self._device.turn_on()
             if self._instance.reset:
                 LOGGER.debug("Change color to white to reset led strip when other infrared control interact")
                 self._attr_effect = None
-                await self._instance.set_color(self._transform_color_brightness((255, 255, 255), 250), is_base_color=False)
+                await self._device.set_color(self._transform_color_brightness((255, 255, 255), 250), is_base_color=False)
                 # ATTR_WHITE (if present) is applied by the White block below.
 
         
@@ -285,7 +284,7 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
             if new_temp != self.color_temp_kelvin or brightness is not None:
                 new_brightness = brightness if brightness is not None else self.brightness
                 self._attr_effect = None
-                await self._instance.set_color_temp_kelvin(new_temp, new_brightness)
+                await self._device.set_color_temp_kelvin(new_temp, new_brightness)
             brightness_handled = True
 
         # --- White ---
@@ -293,8 +292,8 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
             if ColorMode.WHITE in self._attr_supported_color_modes:
                 self._attr_color_mode = ColorMode.WHITE
             self._attr_effect = None
-            await self._instance.set_color(self._transform_color_brightness((255, 255, 255), kwargs[ATTR_WHITE]), is_base_color=False)
-            await self._instance.set_white(kwargs[ATTR_WHITE])
+            await self._device.set_color(self._transform_color_brightness((255, 255, 255), kwargs[ATTR_WHITE]), is_base_color=False)
+            await self._device.set_white(kwargs[ATTR_WHITE])
             brightness_handled = True
 
         # --- RGB color: write the color, then brightness exactly once ---
@@ -306,14 +305,14 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
             # Always write the color: cached state is not a reliable proxy for
             # what the strip physically shows (mode switches, running effects,
             # IR-remote changes), so an explicit rgb_color request is always sent.
-            await self._instance.set_color(color, is_base_color=True)
+            await self._device.set_color(color, is_base_color=True)
             if target_brightness is not None and (
                 target_brightness < 255 or target_brightness != self.brightness
             ):
                 # Re-dim the full-scale color just written (RGB-scaling models),
                 # or push a changed brightness -- including a change *to* 255,
                 # which resets a previously-dimmed native brightness register.
-                await self._instance.set_brightness(target_brightness)
+                await self._device.set_brightness(target_brightness)
             brightness_handled = True
 
         # --- Brightness only (no color/temp/white attribute in this call) ---
@@ -327,11 +326,11 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
                         + self._instance.max_color_temp_kelvin
                     ) // 2
                 self._attr_effect = None
-                await self._instance.set_color_temp_kelvin(current_temp, brightness)
+                await self._device.set_color_temp_kelvin(current_temp, brightness)
             elif self._attr_color_mode == ColorMode.WHITE:
-                await self._instance.set_white(brightness)
+                await self._device.set_white(brightness)
             else:  # RGB or any other mode
-                await self._instance.set_brightness(brightness)
+                await self._device.set_brightness(brightness)
 
         if ATTR_EFFECT in kwargs and kwargs[ATTR_EFFECT] != self.effect:
             self._attr_effect = kwargs[ATTR_EFFECT]
@@ -341,18 +340,18 @@ class BLEDOMLight(BLEDOMEntity, RestoreEntity, LightEntity):
                 effects_class_name = self._instance.model.get_effects_class(self._instance.model_name)
             effects_class = EFFECTS_MAP.get(effects_class_name, EFFECTS)
             effect_value = effects_class[kwargs[ATTR_EFFECT]].value
-            await self._instance.set_effect(effect_value)
+            await self._device.set_effect(effect_value)
             # Also send effect speed to ensure it's applied
             if self._instance.effect_speed is not None:
-                await self._instance.set_effect_speed(self._instance.effect_speed)
+                await self._device.set_effect_speed(self._instance.effect_speed)
 
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         LOGGER.debug(f"Params turn off: {kwargs} color mode: {self._attr_color_mode}")
-        await self._instance.turn_off()
+        await self._device.turn_off()
         self.async_write_ha_state()
 
     async def async_update(self) -> None:
-        await self._instance.update()
+        await self._device.update()
         self.async_write_ha_state()
