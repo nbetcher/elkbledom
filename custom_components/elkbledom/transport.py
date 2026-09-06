@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
@@ -77,11 +78,14 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                 except (CharacteristicMissingError, NotConnectedError):
                     self._set_available(False)
                     raise
-                except BleakNotFoundError as err:
-                    self._set_available(False)
-                    raise NotConnectedError(str(err)) from err
                 except RETRY_EXCEPTIONS as err:
-                    if attempt >= max_attempts:
+                    # The connector also uses BleakNotFoundError for an
+                    # exhausted connect timeout. That does not prove the
+                    # device is absent: retry with HA's current route.
+                    missing_device = isinstance(err, BleakNotFoundError) and not isinstance(
+                        err.__cause__, TimeoutError
+                    )
+                    if missing_device or attempt >= max_attempts:
                         self._set_available(False)
                         raise NotConnectedError(str(err)) from err
                     LOGGER.debug(
@@ -136,6 +140,40 @@ class UnsupportedCommandError(ServiceValidationError):
         )
 
 
+@dataclass
+class _ConnectionAttemptBudget:
+    """Physical connection budget shared by one serialized HA operation."""
+
+    remaining: int = DEFAULT_ATTEMPTS
+    last_error: Exception | None = None
+
+    def consume(self) -> None:
+        if self.remaining <= 0:
+            raise NotConnectedError(
+                f"Bluetooth connection attempt limit ({DEFAULT_ATTEMPTS}) reached"
+            ) from self.last_error
+        self.remaining -= 1
+
+
+class _BudgetedBleakClient(BleakClientWithServiceCache):
+    """Retain connector behavior while bounding its separate transient retries."""
+
+    def __init__(self, *args, connection_budget: _ConnectionAttemptBudget, **kwargs):
+        self._connection_budget = connection_budget
+        super().__init__(*args, **kwargs)
+
+    async def connect(self, **kwargs) -> None:
+        # max_attempts in bleak-retry-connector does not cap transient errors.
+        # Count actual connect calls, including its internal retries. The
+        # budget is passed per operation, never patched into dependency globals.
+        self._connection_budget.consume()
+        try:
+            await super().connect(**kwargs)
+        except RETRY_EXCEPTIONS as err:
+            self._connection_budget.last_error = err
+            raise
+
+
 class BLETransport:
     """Owns the BLE connection lifecycle, the write path + pacing, the retry
     decorator, availability + the callback registry, MELK/MODELX login,
@@ -162,6 +200,7 @@ class BLETransport:
         self._operation_lock: asyncio.Lock = asyncio.Lock()
         self._operation_owner: asyncio.Task | None = None
         self._operation_depth = 0
+        self._connection_budget: _ConnectionAttemptBudget | None = None
         self._batch_depth = 0
         self._client: BleakClientWithServiceCache | None = None
         self._stopped = False
@@ -228,9 +267,11 @@ class BLETransport:
         await self._operation_lock.acquire()
         self._operation_owner = task
         self._operation_depth = 1
+        self._connection_budget = _ConnectionAttemptBudget()
         try:
             yield
         finally:
+            self._connection_budget = None
             self._operation_depth = 0
             self._operation_owner = None
             self._operation_lock.release()
@@ -383,7 +424,7 @@ class BLETransport:
             gap = COMMAND_GAP - (self.loop.time() - self._last_write_at)
             if gap > 0:
                 await asyncio.sleep(gap)
-        LOGGER.debug("".join(format(x, " 03x") for x in data))
+        LOGGER.debug("%s: Sending BLE command: %s", self.name, bytes(data).hex(" "))
         await self._client.write_gatt_char(
             self._write_uuid, data, response=self._write_requires_response
         )
@@ -421,21 +462,21 @@ class BLETransport:
                         f"No connectable Bluetooth path can reach {self._address}"
                     )
                 client = await establish_connection(
-                    BleakClientWithServiceCache,
+                    _BudgetedBleakClient,
                     self._device,
                     self.name,
                     self._disconnected,
                     cached_services=self._cached_services,
-                    # Re-query HA for the freshest connectable device each
-                    # attempt (falling back to the last known one) so the
-                    # retry connector can pick the current best proxy path
-                    # instead of a device frozen at setup time.
+                    # HA's wrapped client selects its current best backend on
+                    # every connect(). Retain this callback for connector
+                    # versions that consult it; the entry lookup above also
+                    # refreshes the BLEDevice on each outer intent retry.
                     ble_device_callback=lambda: self._fresh_ble_device() or self._device,
-                    # One connect attempt here; the outer
-                    # @retry_bluetooth_connection_error owns the retry budget
-                    # so the two layers don't multiply into a long, radio-
-                    # hogging storm under the operation lock.
+                    # Non-transient failures return to the intent retry loop.
+                    # The client also counts the connector's internal transient
+                    # retries against the SAME operation-wide physical budget.
                     max_attempts=1,
+                    connection_budget=self._connection_budget,
                 )
             except TimeoutError:
                 # Re-raise rather than return: returning leaves self._client None

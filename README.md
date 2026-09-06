@@ -196,6 +196,7 @@ handle: 0x0008, char properties: 0x06, char value handle: 0x0009, uuid: 0000fff3
 | `0000fff3-...` or `0000ffe1-...` | **Compatible** | This repository |
 | `0000ff01-...` | Use different integration | [lednetwf_ble](https://github.com/raulgbcr/lednetwf_ble) |
 | `0000ffd5-...`, `0000ffd9-...`, etc. | Use different integration | [led_ble](https://www.home-assistant.io/integrations/led_ble/) |
+| `0000ac5x-...` (iStrip+) | Use different integration | [istrip_plus](https://github.com/vakintosh/istrip_plus_HA) |
 
 ### Using BTScan for Unsupported Devices
 
@@ -436,6 +437,22 @@ After setup, you can configure additional options:
 - **EFFECTS_MELK_Ox** - 13 MELK-Ox series effects
 - **EFFECTS_DMRRBA** - 9 DMRRBA effects (flash, breath, candle)
 - **EFFECTS_STRIPX** - 228 advanced effects (music-reactive, chase, fire, fade, pulse, elevator, rainbow)
+
+Effect-speed controls currently use a conservative `0–100` range. Out-of-range
+commands are rejected; older saved values are clamped when restored. Limits can
+be defined per model, but wider values require controller-specific evidence.
+Models with only a fixed speed frame (`XSL-` and `LED LIGHT STRIP`) do not expose
+an adjustable speed control. See the [speed-limit investigation](docs/upstream-port-and-speed-limits.md).
+
+`XSL-` and `LED LIGHT STRIP` currently expose power only: their captured
+brightness, color-temperature, and effect frames do not encode adjustable values.
+The eight unencodable `music_*` light effects on `MELK-OA21` are hidden; supported
+microphone controls remain separate. Additional commands require verified protocol
+captures before they can be enabled.
+
+Light settings are stored separately from HA's displayed state so turning a light
+off does not discard its remembered brightness and color at restart. Settings
+already absent from older saved off states cannot be reconstructed automatically.
 
 **Multiple Devices**
 - Control multiple lights independently

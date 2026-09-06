@@ -7,6 +7,7 @@ from pathlib import Path
 from homeassistant.core import HomeAssistant
 
 from .const import EFFECTS_LIST_MAP, EFFECTS_MAP, populate_effects_from_data
+from .limits import EffectSpeedLimits
 
 LOGGER = logging.getLogger(__name__)
 
@@ -295,14 +296,29 @@ class Model:
         """Get white command for model with intensity by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("white", []).copy()
+            if "i" not in cmd:
+                return None
             # Replace 'i' placeholder with the scaled intensity value
             scaled = self._scale_intensity(intensity)
             return [scaled if x == "i" else x for x in cmd]
         return None
 
-    def get_effect_speed_cmd(self, internal_key: str, value: int) -> list[int] | None:
+    def get_effect_speed_limits(self, internal_key: str) -> EffectSpeedLimits:
+        """Read model-specific limits without assuming a full-byte device range."""
+        limits = self._models.get(internal_key, {}).get("effect_speed_range", {})
+        if not isinstance(limits, dict):
+            raise ValueError(f"Invalid effect_speed_range for {internal_key}")
+        return EffectSpeedLimits(limits.get("min", 0), limits.get("max", 100))
+
+    def supports_effect_speed(self, internal_key: str) -> bool:
+        """A fixed captured frame is not evidence of an adjustable speed control."""
+        command = self._models.get(internal_key, {}).get("commands", {}).get("effect_speed", [])
+        return "v" in command
+
+    def get_effect_speed_cmd(self, internal_key: str, value: int | float) -> list[int] | None:
         """Get effect speed command for model by internal key"""
-        if internal_key in self._models:
+        if self.supports_effect_speed(internal_key):
+            value = self.get_effect_speed_limits(internal_key).validate(value)
             cmd = self._models[internal_key].get("commands", {}).get("effect_speed", []).copy()
             # Replace 'v' placeholder with value
             return [int(value) if x == "v" else x for x in cmd]
@@ -312,14 +328,23 @@ class Model:
         """Get effect command for model by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("effect", []).copy()
+            if "v" not in cmd or isinstance(value, bool) or not isinstance(value, int):
+                return None
+            if not 0 <= value <= 255:
+                return None
             # Replace 'v' placeholder with value
-            return [int(value) if x == "v" else x for x in cmd]
+            result = [value if x == "v" else x for x in cmd]
+            if not all(type(byte) is int and 0 <= byte <= 255 for byte in result):
+                return None
+            return result
         return None
 
     def get_color_temp_cmd(self, internal_key: str, warm: int, cold: int) -> list[int] | None:
         """Get color temperature command for model by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("color_temp", []).copy()
+            if not {"w", "c"}.issubset(cmd):
+                return None
             # Replace 'w' and 'c' placeholders with warm and cold values
             result = []
             for x in cmd:
@@ -336,6 +361,8 @@ class Model:
         """Get color command for model by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("color", []).copy()
+            if not {"r", "g", "b"}.issubset(cmd):
+                return None
             # Replace 'r', 'g', 'b' placeholders with RGB values
             result = []
             for x in cmd:
@@ -354,6 +381,8 @@ class Model:
         """Get brightness command for model by internal key"""
         if internal_key in self._models:
             cmd = self._models[internal_key].get("commands", {}).get("brightness", []).copy()
+            if "i" not in cmd:
+                return None
             # Replace 'i' placeholder with the scaled intensity value
             scaled = self._scale_intensity(intensity)
             return [scaled if x == "i" else x for x in cmd]
@@ -387,7 +416,7 @@ class Model:
         """Coerce JSON-loaded Kelvin values into Home Assistant's range."""
         try:
             value = int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return default
         return value if 1000 <= value <= 40000 else default
 

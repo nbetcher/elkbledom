@@ -416,11 +416,21 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         aliases = list(survivor.aliases)
         labels = set(survivor.labels)
         categories = dict(survivor.categories)
+        # Registry options are domain-specific mappings. Preserve the oldest
+        # row's explicit choices, including False/None, and fill missing keys
+        # from newer duplicates. Never mutate HA's immutable registry mappings.
+        merged_options = {
+            domain: dict(options) for domain, options in getattr(survivor, "options", {}).items()
+        }
         for duplicate in rows[1:]:
             aliases.extend(alias for alias in duplicate.aliases if alias not in aliases)
             labels.update(duplicate.labels)
             for scope, category in duplicate.categories.items():
                 categories.setdefault(scope, category)
+            for domain, options in getattr(duplicate, "options", {}).items():
+                target_options = merged_options.setdefault(domain, {})
+                for key, value in options.items():
+                    target_options.setdefault(key, value)
 
         entity_survivors.append(
             (
@@ -436,6 +446,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "icon": _first_registry_value(rows, "icon"),
                     "labels": labels,
                     "name": _first_registry_value(rows, "name"),
+                    "options": merged_options,
                 },
             )
         )
@@ -537,7 +548,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     for survivor, _new_unique_id, metadata in entity_survivors:
-        entity_registry.async_update_entity(survivor.entity_id, **metadata)
+        options = metadata["options"]
+        entity_registry.async_update_entity(
+            survivor.entity_id,
+            **{key: value for key, value in metadata.items() if key != "options"},
+        )
+        for domain, domain_options in options.items():
+            entity_registry.async_update_entity_options(survivor.entity_id, domain, domain_options)
     for duplicate_entity_id in duplicate_entity_ids:
         entity_registry.async_remove(duplicate_entity_id)
 

@@ -58,6 +58,17 @@ async def test_real_registry_migration_preserves_entities_and_linked_helpers(tmp
         suggested_object_id="duplicate",
     )
     entity_registry.async_update_entity(duplicate.entity_id, aliases={"Reading strip"})
+    entity_registry.async_update_entity_options(
+        original.entity_id, "light", {"default_transition": 0, "explicit_none": None}
+    )
+    entity_registry.async_update_entity_options(
+        duplicate.entity_id,
+        "light",
+        {"default_transition": 5, "explicit_none": 10, "custom_option": False},
+    )
+    entity_registry.async_update_entity_options(
+        duplicate.entity_id, "conversation", {"should_expose": False}
+    )
     helper = entity_registry.async_get_or_create(
         "sensor",
         "template",
@@ -75,8 +86,14 @@ async def test_real_registry_migration_preserves_entities_and_linked_helpers(tmp
         survivor = entity_registry.async_get(original.entity_id)
         assert survivor.unique_id == "aa:bb:cc:dd:ee:ff"
         assert "Reading strip" in survivor.aliases
+        expected_options = {
+            "light": {"default_transition": 0, "explicit_none": None, "custom_option": False},
+            "conversation": {"should_expose": False},
+        }
+        assert dict(survivor.options) == expected_options
         assert entity_registry.async_get(helper.entity_id).device_id == old_device.id
         assert device_registry.async_get(duplicate_device.id) is None
         assert await async_migrate_entry(hass, entry) is True
+        assert dict(entity_registry.async_get(original.entity_id).options) == expected_options
     finally:
         await hass.async_stop(force=True)

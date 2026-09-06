@@ -42,6 +42,7 @@
   },
   {
     "name": "ELK-BLEDOB",
+    "effect_speed_range": {"min": 0, "max": 100},
     "write_uuid": "0000fff3-0000-1000-8000-00805f9b34fb",
     "read_uuid": "0000fff4-0000-1000-8000-00805f9b34fb",
     "effects_class": "EFFECTS",

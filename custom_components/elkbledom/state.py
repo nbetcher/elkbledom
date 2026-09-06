@@ -10,6 +10,8 @@ match that source exactly. No BLE, no HA imports -- typing only.
 from contextlib import suppress
 from dataclasses import dataclass
 
+from .limits import DEFAULT_EFFECT_SPEED_LIMITS, EffectSpeedLimits
+
 # Sentinel distinguishing "argument not provided" from an explicit None, so
 # restore() can skip untouched fields without treating None as a real value.
 _MISSING = object()
@@ -23,7 +25,7 @@ class ElkState:
     rgb_color_base: tuple[int, int, int] = (255, 255, 255)  # 170  base w/o brightness scaling
     brightness: int = 255  # 171
     effect: int | None = None  # 172
-    effect_speed: int = 50  # 173  (NOT 0 -- device range 0-100, default medium)
+    effect_speed: int = 50  # Conservative default, constrained by the selected model.
     color_temp_kelvin: int | None = None  # 174
     mic_effect: int | None = None  # 175
     mic_sensitivity: int = 50  # 176
@@ -49,6 +51,7 @@ class ElkState:
         color_temp_kelvin=_MISSING,
         effect=_MISSING,
         effect_speed=_MISSING,
+        effect_speed_limits: EffectSpeedLimits = DEFAULT_EFFECT_SPEED_LIMITS,
         mic_enabled=_MISSING,
         couple_base: bool = True,
     ) -> None:
@@ -59,22 +62,22 @@ class ElkState:
         if is_on is not _MISSING and is_on is not None:
             self.is_on = bool(is_on)
         if brightness is not _MISSING and brightness is not None:
-            with suppress(TypeError, ValueError):
+            with suppress(TypeError, ValueError, OverflowError):
                 self.brightness = max(1, min(int(brightness), 255))
         if rgb_color is not _MISSING:
-            with suppress(TypeError, ValueError):
+            with suppress(TypeError, ValueError, OverflowError):
                 rgb = tuple(max(0, min(int(channel), 255)) for channel in rgb_color)
                 if len(rgb) == 3:
                     self.rgb_color = rgb
                     if couple_base:
                         self.rgb_color_base = rgb
         if color_temp_kelvin is not _MISSING and color_temp_kelvin is not None:
-            with suppress(TypeError, ValueError):
+            with suppress(TypeError, ValueError, OverflowError):
                 self.color_temp_kelvin = max(1000, min(int(color_temp_kelvin), 40000))
         if effect is not _MISSING:
             self.effect = effect
         if effect_speed is not _MISSING and effect_speed is not None:
-            with suppress(TypeError, ValueError):
-                self.effect_speed = max(0, min(int(effect_speed), 100))
+            with suppress(TypeError, ValueError, OverflowError):
+                self.effect_speed = effect_speed_limits.clamp(effect_speed)
         if mic_enabled is not _MISSING:
             self.mic_enabled = mic_enabled

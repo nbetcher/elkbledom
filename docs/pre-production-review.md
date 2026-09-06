@@ -1,5 +1,15 @@
 # Pre-production review — 2026-09-05
 
+Latest status: [review remediation and regression gates](review-remediation.md).
+That follow-up supersedes the verdict and validation results in this historical
+snapshot, including the retry-budget and state-restoration claims.
+
+Follow-up: [selective upstream ports and speed-limit investigation](upstream-port-and-speed-limits.md)
+describe subsequent source changes. The validation counts and archive below are
+the original review snapshot, not validation of those later edits. Repository
+Issues and topics were subsequently enabled with authorization; that specific
+settings gate is resolved, while physical proxy qualification remains pending.
+
 ## Verdict
 
 The remediated source and extracted integration archive pass the checks below.

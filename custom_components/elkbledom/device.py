@@ -48,6 +48,7 @@ class ElkDevice:
         # Device-local policy knob — NOT part of the optimistic state cache.
         mode = (brightness_mode or "auto").lower()
         self._brightness_mode = mode if mode in ("auto", "rgb", "native") else "auto"
+        self._effect_speed_restored_from_number = False
 
     # ---- decorator-binding proxies (so the copied @retry body is byte-identical) ----
     @property
@@ -85,6 +86,19 @@ class ElkDevice:
 
     def get_color_base(self):
         return self.state.get_color_base()
+
+    def restore_effect_speed(self, value, *, from_number: bool = False) -> None:
+        """Restore without I/O; the number's own record wins over light attributes."""
+        if self._effect_speed_restored_from_number and not from_number:
+            return
+        limits = self.protocol.model.get_effect_speed_limits(self.protocol.model_name)
+        try:
+            value = limits.clamp(value)
+        except (TypeError, ValueError, OverflowError):
+            return
+        self.state.restore(effect_speed=value, effect_speed_limits=limits)
+        if from_number:
+            self._effect_speed_restored_from_number = True
 
     # ---- mic-exit policy (invariant #7) ----
     async def _exit_mic_mode(self) -> None:
@@ -126,7 +140,6 @@ class ElkDevice:
     async def set_color_temp_kelvin(self, value: int, brightness: int) -> None:
         # White colours are represented by a percentage from 0x00 (warm) to
         # 0x64 (cool), with a blend of the two channels between those values.
-        await self._exit_mic_mode()
         min_temp = self.protocol.model.get_min_color_temp_kelvin(self.protocol.model_name)
         max_temp = self.protocol.model.get_max_color_temp_kelvin(self.protocol.model_name)
         value = max(value, min_temp)
@@ -150,6 +163,7 @@ class ElkDevice:
             # one atomic operation so the pair can't be interleaved by another
             # command on the same device (an empty white_cmd is skipped).
             white_cmd = self.protocol.model.get_white_cmd(self.protocol.model_name, brightness)
+            await self._exit_mic_mode()
             await self.transport.write_frames(cmd, white_cmd)
             # Cache only after the write succeeds, and brightness only if it was
             # actually transmitted (no white command -> nothing applied it).
@@ -180,6 +194,9 @@ class ElkDevice:
         color_cmd = self.protocol.model.get_color_cmd(
             self.protocol.model_name, r_scaled, g_scaled, b_scaled
         )
+        if not color_cmd:
+            raise UnsupportedCommandError(f"{self.name}: model has no color temperature command")
+        await self._exit_mic_mode()
         await self.transport.write_frame(color_cmd)
         # RGB fallback DECOUPLES base from rgb (raw field writes, not apply_color):
         # rgb_color=scaled, rgb_color_base=unscaled interpolated white (§8.3).
@@ -191,13 +208,13 @@ class ElkDevice:
 
     @retry_bluetooth_connection_error
     async def set_color(self, rgb: tuple[int, int, int], is_base_color: bool = False) -> None:
-        await self._exit_mic_mode()
         r, g, b = rgb
         color_cmd = self.protocol.model.get_color_cmd(self.protocol.model_name, r, g, b)
         if not color_cmd:
             # White/temp-only models have no color command; don't pollute the
             # cached RGB state with a write that never happened.
             raise UnsupportedCommandError(f"{self.name}: model has no RGB color command")
+        await self._exit_mic_mode()
         await self.transport.write_frame(color_cmd)
         self.state.rgb_color = rgb
         self.state.effect = None
@@ -207,11 +224,13 @@ class ElkDevice:
 
     @retry_bluetooth_connection_error
     async def set_white(self, intensity: int) -> None:
-        await self._exit_mic_mode()
         if intensity is None:
             intensity = 255
         intensity = max(1, min(int(intensity), 255))
         white_cmd = self.protocol.model.get_white_cmd(self.protocol.model_name, intensity)
+        if not white_cmd:
+            raise UnsupportedCommandError(f"{self.name}: model has no adjustable white command")
+        await self._exit_mic_mode()
         await self.transport.write_frame(white_cmd)
         self.state.brightness = intensity
         self.state.effect = None
@@ -219,7 +238,6 @@ class ElkDevice:
     @retry_bluetooth_connection_error
     async def set_brightness(self, intensity: int) -> None:
         """Set brightness with configurable mode (auto/rgb/native)."""
-        await self._exit_mic_mode()
         value = max(1, min(int(intensity), 255))
         percent = round(value * 100 / 255)  # logging only; commands scale internally
         mode = (self._brightness_mode or "auto").lower()
@@ -232,6 +250,13 @@ class ElkDevice:
         # get_white_cmd); passing an already-converted percent double-scales.
         native_cmd = self.protocol.model.get_brightness_cmd(self.protocol.model_name, value)
         has_rgb = bool(self.protocol.model.get_color_cmd(self.protocol.model_name, 255, 255, 255))
+        if (
+            (mode == "rgb" and not has_rgb)
+            or (mode == "native" and not native_cmd)
+            or (not native_cmd and not has_rgb)
+        ):
+            raise UnsupportedCommandError(f"{self.name}: model has no requested brightness command")
+        await self._exit_mic_mode()
 
         async def write_rgb_scaled():
             """Scale RGB from the base color and write it directly (not via the
@@ -272,17 +297,11 @@ class ElkDevice:
                     f"{self.name}: model has no native brightness command"
                 )
             await write_native()
-        # Prefer native, but fall back to RGB scaling when the model has no
-        # native brightness command (an empty command is a silent no-op, not
-        # an exception) or when the native write fails.
+        # Auto is capability selection, not transport-error recovery. An RGB
+        # fallback after a transient native failure would stop a running effect.
+        # Let the intent retry the same native command instead.
         elif native_cmd:
-            try:
-                await write_native()
-            except Exception as e:
-                if not has_rgb:
-                    raise
-                LOGGER.warning("%s: Native brightness failed, fallback to RGB: %s", self.name, e)
-                await write_rgb_scaled()
+            await write_native()
         elif has_rgb:
             await write_rgb_scaled()
         else:
@@ -292,18 +311,22 @@ class ElkDevice:
         self.state.brightness = value
 
     @retry_bluetooth_connection_error
-    async def set_effect_speed(self, value: int) -> None:
-        # Device speed is a 0-100 percent; clamp so an out-of-range value (e.g. a
-        # restored 0-255 value from before this range fix) isn't sent verbatim.
-        value = max(0, min(int(value), 100))
-        effect_speed = self.protocol.model.get_effect_speed_cmd(self.protocol.model_name, value)
+    async def set_effect_speed(self, value: int | float) -> None:
+        try:
+            limits = self.protocol.model.get_effect_speed_limits(self.protocol.model_name)
+            value = limits.validate(value)
+            effect_speed = self.protocol.model.get_effect_speed_cmd(self.protocol.model_name, value)
+        except (TypeError, ValueError, OverflowError) as err:
+            raise UnsupportedCommandError(f"{self.name}: {err}") from err
         await self.transport.write_frame(effect_speed)
         self.state.effect_speed = value
 
     @retry_bluetooth_connection_error
     async def set_effect(self, value: int) -> None:
-        await self._exit_mic_mode()
         effect = self.protocol.model.get_effect_cmd(self.protocol.model_name, value)
+        if not effect:
+            raise UnsupportedCommandError(f"{self.name}: unsupported effect value {value!r}")
+        await self._exit_mic_mode()
         await self.transport.write_frame(effect)
         self.state.effect = value
 

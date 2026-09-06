@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ from bleak.exc import BleakError
 
 import custom_components.elkbledom.transport as transport_module
 from custom_components.elkbledom.device import ElkDevice
+from custom_components.elkbledom.light import BLEDOMLight
 from custom_components.elkbledom.state import ElkState
 from custom_components.elkbledom.transport import (
     BLETransport,
@@ -167,7 +169,7 @@ async def test_connector_uses_one_attempt_and_fresh_proxy_path(monkeypatch) -> N
     transport._write_uuid = None
     transport._ensure_connected = BLETransport._ensure_connected.__get__(transport)
 
-    await transport._ensure_connected()
+    await transport.connect()
 
     assert captured["max_attempts"] == 1
     assert captured["ble_device_callback"]() is fresh_device
@@ -319,6 +321,53 @@ async def test_native_brightness_preserves_running_effect() -> None:
     await device.set_brightness(128)
     assert state.effect == 42
     assert client.writes == [bytes([128])]
+
+
+@pytest.mark.parametrize("selected", [(255, 127, 63), (128, 64, 32), (0, 0, 0)])
+async def test_dimming_and_restore_preserve_reported_rgb_selection(monkeypatch, selected) -> None:
+    monkeypatch.setattr(transport_module, "COMMAND_GAP", 0)
+    protocol = FakeProtocol()
+    protocol.model = SimpleNamespace(
+        get_brightness_cmd=lambda *_args: None,
+        get_color_cmd=FakeModel.get_color_cmd,
+    )
+    state = ElkState()
+    device = ElkDevice(_transport(FakeClient()), protocol, state, brightness_mode="rgb")
+    light = BLEDOMLight.__new__(BLEDOMLight)
+    await device.set_color(selected, is_base_color=True)
+    for brightness in (255, 128, 5, 1, 128, 255):
+        await device.set_brightness(brightness)
+        light._instance = SimpleNamespace(
+            rgb_color=state.rgb_color, get_color_base=state.get_color_base
+        )
+        assert light.rgb_color == selected
+        restored = ElkState()
+        restored.restore(rgb_color=light.rgb_color, brightness=brightness)
+        assert restored.rgb_color_base == selected
+
+
+async def test_transient_native_brightness_failure_retries_without_rgb_fallback(monkeypatch):
+    monkeypatch.setattr(transport_module, "BLEAK_BACKOFF_TIME", 0)
+    protocol = FakeProtocol()
+    protocol.model = SimpleNamespace(
+        get_brightness_cmd=lambda _model, value: [value],
+        get_color_cmd=FakeModel.get_color_cmd,
+    )
+    client = FakeClient()
+    client.write_gatt_char = AsyncMock(side_effect=[BleakError("temporary proxy failure"), None])
+    state = ElkState(effect=42, brightness=200)
+    device = ElkDevice(_transport(client), protocol, state)
+    await device.set_brightness(128)
+    assert [call.args[1] for call in client.write_gatt_char.await_args_list] == [[128], [128]]
+    assert state.effect == 42
+    assert state.brightness == 128
+
+
+async def test_ble_command_log_identifies_device(caplog) -> None:
+    transport = _transport(FakeClient())
+    with caplog.at_level(logging.DEBUG, logger=transport_module.__name__):
+        await transport.write_frame([0x7E, 0x04, 0x02, 0x32, 0xEF])
+    assert "ELK-BLEDOM: Sending BLE command: 7e 04 02 32 ef" in caplog.text
 
 
 @pytest.mark.parametrize(
