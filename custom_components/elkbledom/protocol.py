@@ -1,5 +1,4 @@
 import logging
-from typing import List, Optional
 
 from .model import Model
 
@@ -20,7 +19,7 @@ class ElkProtocol:
     on ``BLETransport`` (see the P5 note below).
     """
 
-    def __init__(self, hass, device_name_getter, forced_model: Optional[str] = None) -> None:
+    def __init__(self, hass, device_name_getter, forced_model: str | None = None) -> None:
         # device_name_getter: Callable[[], str|None] -> transport/facade supplies
         # the current BLE device name lazily (name may only exist after _device
         # is set). Mirrors reads of self._device.name in _detect_model. The getter
@@ -29,8 +28,8 @@ class ElkProtocol:
         self._hass = hass
         self._get_name = device_name_getter
         self._forced_model = forced_model
-        self._model: Optional[Model] = None
-        self._model_name: Optional[str] = None
+        self._model: Model | None = None
+        self._model_name: str | None = None
         # NOTE (P5): ElkProtocol holds NO resolved GATT UUIDs. read_uuid()/write_uuid()
         # below are *model-table lookups* (Model.get_*_uuid) used for characteristic
         # resolution + login; the resolved, stringified handles the write path
@@ -41,7 +40,7 @@ class ElkProtocol:
 
     # ---- supported-model predicate (config-flow discovery filter) ----
     @staticmethod
-    def is_supported(hass, name: Optional[str]) -> bool:
+    def is_supported(hass, name: str | None) -> bool:
         """True if the advertised BLE name resolves to a known model.
 
         Same boolean as DeviceData's old inline check
@@ -57,14 +56,14 @@ class ElkProtocol:
         return self._model
 
     @property
-    def model_name(self) -> Optional[str]:
+    def model_name(self) -> str | None:
         return self._model_name
 
     @property
-    def forced_model(self) -> Optional[str]:
+    def forced_model(self) -> str | None:
         return self._forced_model
 
-    def detect_model(self, char_handle: Optional[int] = None) -> None:
+    def detect_model(self, char_handle: int | None = None) -> None:
         """Detect the model using Model manager.
 
         Was ``_detect_model`` (elkbledom.py:221-252). Populates ``self._model`` /
@@ -84,9 +83,18 @@ class ElkProtocol:
             # Use handle-based detection when available
             detected = self._model.detect_model_by_handle(name or "", char_handle)
             if detected:
-                if hasattr(self, "_model_name") and self._model_name and detected != self._model_name:
-                    LOGGER.info("%s: Model refined from '%s' to '%s' based on handle 0x%04x",
-                                name, self._model_name, detected, char_handle)
+                if (
+                    hasattr(self, "_model_name")
+                    and self._model_name
+                    and detected != self._model_name
+                ):
+                    LOGGER.info(
+                        "%s: Model refined from '%s' to '%s' based on handle 0x%04x",
+                        name,
+                        self._model_name,
+                        detected,
+                        char_handle,
+                    )
                 self._model_name = detected
             else:
                 LOGGER.warning("Unknown model for device %s with handle 0x%04x", name, char_handle)
@@ -106,32 +114,32 @@ class ElkProtocol:
         self.detect_model(char_handle)
 
     # ---- UUID lookups the transport consumes (from _resolve_characteristics) ----
-    def read_uuid(self) -> Optional[str]:
-        return self._model.get_read_uuid(self._model_name)   # 999
+    def read_uuid(self) -> str | None:
+        return self._model.get_read_uuid(self._model_name)  # 999
 
-    def write_uuid(self) -> Optional[str]:
+    def write_uuid(self) -> str | None:
         return self._model.get_write_uuid(self._model_name)  # 1008/1018
 
     # ---- connection-family predicates (name-prefix logic; centralized here so
     #      transport/device call these instead of hardcoding strings). ----
-    def requires_login(self, name: str) -> bool:      # 872
+    def requires_login(self, name: str) -> bool:  # 872
         n = (name or "").lower()
-        return n.startswith("melk") or n.startswith("modelx")
+        return n.startswith(("melk", "modelx"))
 
     def requires_read_uuid(self, name: str) -> bool:  # 1026-1029 (inverted)
         n = (name or "").lower()
-        return not (n.startswith("melk") or n.startswith("modelx"))
+        return not n.startswith(("melk", "modelx"))
 
     def uses_notifications(self, name: str) -> bool:  # 957 / 1111
         n = (name or "").lower()
-        return not (n.startswith("melk") or n.startswith("ledble"))
+        return not n.startswith(("melk", "ledble"))
 
     def mic_effect_extended(self, name: str) -> bool:  # 661-662 (device uses this)
         n = (name or "").lower()
-        return n.startswith("melk") or n.startswith("modelx")
+        return n.startswith(("melk", "modelx"))
 
-    def login_frames(self) -> tuple:      # 896/898
-        return (bytes([0x7e, 0x07, 0x83]), bytes([0x7e, 0x04, 0x04]))
+    def login_frames(self) -> tuple:  # 896/898
+        return (bytes([0x7E, 0x07, 0x83]), bytes([0x7E, 0x04, 0x04]))
 
     def login_step_delay(self) -> float:  # LOGIN_STEP_DELAY
         return 1.0
@@ -140,22 +148,24 @@ class ElkProtocol:
     #      Model-DEPENDENT frames (turn_on/off, white, color, color_temp, brightness,
     #      effect, effect_speed, query) STAY in models.json via Model.get_*_cmd.
     @staticmethod
-    def mic_power(on: bool) -> List[int]:                         # 683 (on) / 376,696 (off)
-        return [0x7e, 0x04, 0x07, 0x01 if on else 0x00, 0xff, 0xff, 0xff, 0x00, 0xef]
+    def mic_power(on: bool) -> list[int]:  # 683 (on) / 376,696 (off)
+        return [0x7E, 0x04, 0x07, 0x01 if on else 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]
 
     @staticmethod
-    def mic_eq(value: int, *, extended: bool) -> List[int]:      # 661-664 (clamp is protocol-level)
+    def mic_eq(value: int, *, extended: bool) -> list[int]:  # 661-664 (clamp is protocol-level)
         value = min(max(int(value), 0x80), 0x87 if extended else 0x83)
-        return [0x7e, 0x05, 0x03, value, 0x04, 0xff, 0xff, 0x00, 0xef]
+        return [0x7E, 0x05, 0x03, value, 0x04, 0xFF, 0xFF, 0x00, 0xEF]
 
     @staticmethod
-    def mic_sensitivity(value: int) -> List[int]:                # 676
-        return [0x7e, 0x04, 0x06, value, 0xff, 0xff, 0xff, 0x00, 0xef]
+    def mic_sensitivity(value: int) -> list[int]:  # 676
+        return [0x7E, 0x04, 0x06, value, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]
 
     @staticmethod
-    def scheduler(days: int, hours: int, minutes: int, enabled: bool, *, off: bool) -> List[int]:  # 716-722 / 726-731
+    def scheduler(
+        days: int, hours: int, minutes: int, enabled: bool, *, off: bool
+    ) -> list[int]:  # 716-722 / 726-731
         value = days + 0x80 if enabled else days
-        return [0x7e, 0x08, 0x82, hours, minutes, 0x00, 0x01 if off else 0x00, value, 0xef]
+        return [0x7E, 0x08, 0x82, hours, minutes, 0x00, 0x01 if off else 0x00, value, 0xEF]
 
     # NOTE: time-sync frames are NOT built here -- they stay in the Model table
     # (Model.get_sync_time_cmd / get_custom_time_cmd, used by ElkDevice.sync_time /

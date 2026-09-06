@@ -6,40 +6,48 @@
                     "mac": "Bluetooth MAC address",
                     "name": "Name"
                 },
-                "title": "Pick a Elkbledom light. Make sure light in sight for validation."
+                "title": "Select an ElkBLEDOM light"
             },
             "validate": {
-                "data": {
-                    "retry": "Retry validate connection?",
-                    "flicker": "Did the light blink?"
-                },
+                "data": {},
                 "title": "Validate Elkbledom connection"
+            },
+            "bluetooth_confirm": {
+                "description": "Set up {name}? Home Assistant will verify an active Bluetooth connection before saving it.",
+                "title": "Discovered {name}"
             },
             "settings": {
                 "data": {
                     "delay": "Connection timeout (seconds)"
                 },
                 "data_description": {
-                    "delay": "0 = never disconnect. Range 0–3600 (1 hour); larger values are capped."
+                    "delay": "0 = never disconnect. Range 0–86400 seconds."
                 },
                 "title": "Connection settings"
             },
             "manual": {
                 "data": {
                     "mac": "Bluetooth MAC address",
-                    "name": "Name"
+                    "name": "Name",
+                    "model": "Model",
+                    "effects_class": "Effects class"
                 },
                 "title": "Enter bluetooth MAC address"
             }
         },
         "error": {
-            "connect": "Unable to connect to Elkbledom"
+            "connect": "Unable to connect to Elkbledom",
+            "invalid_mac": "Enter a valid Bluetooth MAC address or CoreBluetooth UUID"
         },
         "abort": {
+            "already_configured": "This device is already configured",
+            "already_in_progress": "This device is already being configured",
             "cannot_validate": "Unable to validate Elkbledom light",
             "cannot_connect": "Unable to connect to Elkbledom",
             "not_supported": "Elkbledom light not supported",
-            "invalid_discovery_info": "Invalid discovery info in bluetooth device"
+            "invalid_discovery_info": "Invalid discovery info in bluetooth device",
+            "no_device_name": "The Bluetooth advertisement has no device name",
+            "not_connectable": "This device was only seen by an advertisement-only Bluetooth scanner"
         }
     },
     "options": {
@@ -47,12 +55,51 @@
             "user": {
                 "data": {
                     "reset": "Reset color when led turn on",
-                    "delay": "Connection timeout (seconds)"
+                    "delay": "Connection timeout (seconds)",
+                    "model": "Model",
+                    "effects_class": "Effects class"
                 },
                 "data_description": {
-                    "delay": "0 = never disconnect. Range 0–3600 (1 hour); larger values are capped."
+                    "delay": "0 = never disconnect. Range 0–86400 seconds."
                 }
             }
+        }
+    },
+    "entity": {
+        "number": {
+            "effect_speed": {
+                "name": "Effect speed"
+            },
+            "mic_sensitivity": {
+                "name": "Microphone sensitivity"
+            }
+        },
+        "select": {
+            "brightness_mode": {
+                "name": "Brightness mode"
+            },
+            "mic_effect": {
+                "name": "Microphone effect"
+            }
+        },
+        "switch": {
+            "microphone": {
+                "name": "Microphone"
+            }
+        }
+    },
+    "exceptions": {
+        "communication_error": {
+            "message": "Bluetooth communication failed: {error}"
+        },
+        "device_unreachable": {
+            "message": "Home Assistant cannot reach {address} through a connectable Bluetooth adapter or proxy: {reason}"
+        },
+        "invalid_target": {
+            "message": "{entity_id} is not a loaded ElkBLEDOM entity"
+        },
+        "unsupported_command": {
+            "message": "The selected model cannot perform this action: {error}"
         }
     },
     "title": "Elkbledom"

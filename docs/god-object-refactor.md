@@ -796,15 +796,14 @@ BLEDOMInstance(address, reset: bool, delay: int, hass,
                config_name: str = None)
 ```
 
-Two positional call sites — the parameter order and defaults are pinned by both:
-- `__init__.py:120` — 7 args:
-  `BLEDOMInstance(entry.data[CONF_MAC], reset, delay, hass, forced_model, brightness_mode, entry.data.get("name"))`
-- `config_flow.py:265` — 5 args:
-  `BLEDOMInstance(self.mac, False, 120, self.hass, self._model_name)` — relies on
-  `brightness_mode="auto"` and `config_name=None` defaults.
+Two positional call sites pin the parameter order and defaults:
+- Config-entry setup passes all seven arguments, including the configured name.
+- Config-flow validation passes the address, reset flag, a short validation delay,
+  Home Assistant, and only an explicitly selected forced model.
 
 Construction-time contract that must hold:
-- Raise `ConfigEntryNotReady` when no connectable device is found (210-211).
+- Raise `NotConnectedError` when no connectable device is found; config-entry
+  setup translates it to `ConfigEntryNotReady` with reachability diagnostics.
 - `_detect_model()` runs **synchronously at construction** (214); `model` and
   `model_name` are populated before any connect. Callers guarantee models are
   loaded via `ensure_models_loaded()` (`__init__.py:118`, `config_flow.py`

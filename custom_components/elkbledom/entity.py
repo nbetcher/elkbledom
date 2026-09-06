@@ -1,4 +1,5 @@
 """Shared base entity for the elkbledom integration."""
+
 from __future__ import annotations
 
 from homeassistant.helpers import device_registry
@@ -32,6 +33,7 @@ class BLEDOMEntity(CoordinatorEntity[ElkCoordinator]):
     # These entities are push-based (state is written after each command and on
     # advertisement/availability changes); HA must not schedule periodic polls.
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(self, coordinator: ElkCoordinator) -> None:
         super().__init__(coordinator)
@@ -50,7 +52,7 @@ class BLEDOMEntity(CoordinatorEntity[ElkCoordinator]):
         CoordinatorEntity.available (which keys off last_update_success) because
         this coordinator never polls -- availability is the transport's truth.
         """
-        return self._instance.available
+        return self.coordinator.last_update_success and self._instance.available
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -58,5 +60,7 @@ class BLEDOMEntity(CoordinatorEntity[ElkCoordinator]):
         return DeviceInfo(
             identifiers={(DOMAIN, self._instance.address)},
             name=self._instance.config_name,
-            connections={(device_registry.CONNECTION_NETWORK_MAC, self._instance.address)},
+            connections={(device_registry.CONNECTION_BLUETOOTH, self._instance.address)},
+            manufacturer="ElkBLEDOM",
+            model=self._instance.model_name,
         )

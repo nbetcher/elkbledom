@@ -7,8 +7,8 @@ from the ``BLEDOMInstance`` __init__ cache (elkbledom.py:168-180); defaults MUST
 match that source exactly. No BLE, no HA imports -- typing only.
 """
 
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 # Sentinel distinguishing "argument not provided" from an explicit None, so
 # restore() can skip untouched fields without treating None as a real value.
@@ -18,19 +18,19 @@ _MISSING = object()
 @dataclass
 class ElkState:
     # Optimistic cache. Defaults MUST match elkbledom.py:168-180 exactly.
-    is_on: Optional[bool] = None                            # 168
-    rgb_color: Optional[Tuple[int, int, int]] = None        # 169
-    rgb_color_base: Tuple[int, int, int] = (255, 255, 255)  # 170  base w/o brightness scaling
-    brightness: int = 255                                   # 171
-    effect: Optional[int] = None                            # 172
-    effect_speed: int = 50                                  # 173  (NOT 0 -- device range 0-100, default medium)
-    color_temp_kelvin: Optional[int] = None                 # 174
-    mic_effect: Optional[int] = None                        # 175
-    mic_sensitivity: int = 50                               # 176
-    mic_enabled: bool = False                               # 177
-    color_temp: Optional[int] = None                        # 180  0-100 warm; set_color_temp path
+    is_on: bool | None = None  # 168
+    rgb_color: tuple[int, int, int] | None = None  # 169
+    rgb_color_base: tuple[int, int, int] = (255, 255, 255)  # 170  base w/o brightness scaling
+    brightness: int = 255  # 171
+    effect: int | None = None  # 172
+    effect_speed: int = 50  # 173  (NOT 0 -- device range 0-100, default medium)
+    color_temp_kelvin: int | None = None  # 174
+    mic_effect: int | None = None  # 175
+    mic_sensitivity: int = 50  # 176
+    mic_enabled: bool = False  # 177
+    color_temp: int | None = None  # 180  0-100 warm; set_color_temp path
 
-    def get_color_base(self) -> Tuple[int, int, int]:
+    def get_color_base(self) -> tuple[int, int, int]:
         """The unscaled base RGB used for brightness scaling (elkbledom.py:264).
 
         ElkDevice writes rgb_color / rgb_color_base directly (the couplings differ
@@ -56,19 +56,25 @@ class ElkState:
         also set rgb_color_base = rgb_color (mirrors light.py:186). None-guards and
         the try/except around RGB stay in the caller; restore() only skips _MISSING.
         """
-        if is_on is not _MISSING:
-            self.is_on = is_on
-        if brightness is not _MISSING:
-            self.brightness = brightness
+        if is_on is not _MISSING and is_on is not None:
+            self.is_on = bool(is_on)
+        if brightness is not _MISSING and brightness is not None:
+            with suppress(TypeError, ValueError):
+                self.brightness = max(1, min(int(brightness), 255))
         if rgb_color is not _MISSING:
-            self.rgb_color = rgb_color
-            if couple_base:
-                self.rgb_color_base = rgb_color
-        if color_temp_kelvin is not _MISSING:
-            self.color_temp_kelvin = color_temp_kelvin
+            with suppress(TypeError, ValueError):
+                rgb = tuple(max(0, min(int(channel), 255)) for channel in rgb_color)
+                if len(rgb) == 3:
+                    self.rgb_color = rgb
+                    if couple_base:
+                        self.rgb_color_base = rgb
+        if color_temp_kelvin is not _MISSING and color_temp_kelvin is not None:
+            with suppress(TypeError, ValueError):
+                self.color_temp_kelvin = max(1000, min(int(color_temp_kelvin), 40000))
         if effect is not _MISSING:
             self.effect = effect
-        if effect_speed is not _MISSING:
-            self.effect_speed = effect_speed
+        if effect_speed is not _MISSING and effect_speed is not None:
+            with suppress(TypeError, ValueError):
+                self.effect_speed = max(0, min(int(effect_speed), 100))
         if mic_enabled is not _MISSING:
             self.mic_enabled = mic_enabled

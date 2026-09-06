@@ -2,9 +2,9 @@
 
 # ELK-BLEDOM Integration for Home Assistant
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/dave-code-ruiz/elkbledom.svg)](https://github.com/dave-code-ruiz/elkbledom/releases)
-[![License](https://img.shields.io/github/license/dave-code-ruiz/elkbledom.svg)](LICENSE)
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
+[![GitHub Release](https://img.shields.io/github/release/nbetcher/elkbledom.svg)](https://github.com/nbetcher/elkbledom/releases)
+[![License](https://img.shields.io/github/license/nbetcher/elkbledom.svg)](LICENSE)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow.svg)](https://www.buymeacoffee.com/davecoderuiz)
 
 ## Support
@@ -85,17 +85,21 @@ This integration currently supports the following device models:
 
 ### Method 1: HACS (Recommended)
 
-1. Open **HACS** in your Home Assistant
-2. Go to **Integrations**
-7. Search for **"elkbledom"** in HACS
-8. Click **Download**
-9. Restart Home Assistant
+1. Open **HACS**, choose **Custom repositories**, and add `https://github.com/nbetcher/elkbledom` as an Integration.
+2. Search for **ElkBLEDOM** and select **Download**.
+3. Restart Home Assistant.
 
 ### Method 2: Manual Installation
 
-1. Download the latest release from [GitHub](https://github.com/dave-code-ruiz/elkbledom/releases)
-2. Extract and copy the `custom_components/elkbledom` folder to your Home Assistant `config/custom_components/` directory
+1. Download the latest release from [GitHub](https://github.com/nbetcher/elkbledom/releases)
+2. For a release integration ZIP, extract its contents into `config/custom_components/elkbledom/`. For GitHub's source-code ZIP, copy its `custom_components/elkbledom` folder into `config/custom_components/`.
 3. Restart Home Assistant
+
+### Removal
+
+1. Remove every ElkBLEDOM config entry from **Settings → Devices & services**.
+2. Remove the integration in HACS, or delete `config/custom_components/elkbledom` for a manual install.
+3. Restart Home Assistant.
 
 ---
 
@@ -103,10 +107,16 @@ This integration currently supports the following device models:
 
 ### System Requirements
 
-This integration requires **Bluetooth support** on your Home Assistant installation. The integration uses:
+This integration requires **Home Assistant 2026.8.0 or newer** and a connectable Bluetooth path. The integration uses:
 
 - **Home Assistant Bluetooth integration** (built-in, enabled by default in recent versions)
-- **Python BLE libraries** (automatically installed)
+- **bleak-retry-connector** (automatically installed by Home Assistant)
+
+### ESPHome Bluetooth Proxy
+
+The integration uses Home Assistant's Bluetooth connection routing, including ESPHome Bluetooth Proxies. The proxy must support active GATT connections; an advertisement-only proxy can discover a strip but cannot control it. Active connections are enabled by default on supported ESP32 and RP2040/RP2350 proxies with current firmware, and the default ESPHome configuration provides three connection slots. Other integrations and devices share those slots. See the [ESPHome proxy requirements](https://esphome.io/components/bluetooth_proxy/).
+
+Keep the default 20-second disconnect delay unless you have a measured reason to change it. Setting the delay to `0` keeps a proxy connection slot occupied continuously.
 
 ### Optional: Manual Bluetooth Tools
 
@@ -132,12 +142,10 @@ yay -S bluez-deprecated-tools
 
 ### Python Requirements
 
-The integration automatically installs these dependencies:
+Home Assistant supplies Bleak and its Bluetooth API. This integration declares only:
 
 ```
-bleak>=0.21.0
-bleak-retry-connector>=3.1.0
-home-assistant-bluetooth>=1.10.0
+bleak-retry-connector>=4.6.0,<5.0
 ```
 
 For development or manual installation, you can install them with:
@@ -194,7 +202,7 @@ handle: 0x0008, char properties: 0x06, char value handle: 0x0009, uuid: 0000fff3
 If your device isn't supported yet, you can help add support:
 
 ```bash
-git clone https://github.com/dave-code-ruiz/elkbledom
+git clone https://github.com/nbetcher/elkbledom
 cd elkbledom
 pip install -r requirements.txt
 python3 BTScan.py
@@ -202,7 +210,9 @@ python3 BTScan.py
 
 This will scan for BLE devices and create a JSON file with technical information. Then:
 
-1. [Create a new issue](https://github.com/dave-code-ruiz/elkbledom/issues/new) on GitHub
+> `BTScan.py` uses the computer's local Bluetooth adapter. It does not communicate through Home Assistant or an ESPHome Bluetooth Proxy.
+
+1. [Create a new issue](https://github.com/nbetcher/elkbledom/issues/new) on GitHub
 2. Attach the generated JSON file
 3. Include device name, brand, and purchase link if available
 
@@ -213,12 +223,13 @@ For more advanced users, check out our [BLE Sniffing Guide](sniffing_ble_device.
 
 ## Quick Start Guide
 
-### Step 1: Enable Bluetooth
+### Step 1: Provide a connectable Bluetooth path
 
-Ensure Bluetooth is enabled on your Home Assistant device:
-1. Go to **Settings** → **System** → **Hardware**
-2. Verify Bluetooth is detected
-3. If not, check your hardware supports Bluetooth or add a USB Bluetooth adapter
+Use either a local Bluetooth adapter or an active ESPHome Bluetooth Proxy:
+
+1. For a local adapter, verify it is detected in Home Assistant's Bluetooth integration.
+2. For a proxy, add it through the ESPHome integration and ensure active GATT connections are enabled with a free connection slot.
+3. Place the strip within range of that adapter or proxy. A proxy-only setup does not need a Bluetooth adapter attached to the Home Assistant host.
 
 ### Step 2: Install Integration
 
@@ -230,7 +241,7 @@ Follow the [Installation](#-installation) instructions above.
 2. Click **+ Add Integration**
 3. Search for **"elkbledom"**
 4. Select your device from the discovered list
-5. Watch your light toggle to confirm connection
+5. Wait while Home Assistant verifies the GATT connection; validation does not intentionally change the light
 6. Click **Submit**
 
 ### Step 4: Control Your Lights
@@ -269,23 +280,11 @@ No backend with an available connection slot that can reach address
 - Wait 30 seconds and try again
 - Power cycle the LED strip
 
-#### 3. MELK Devices - Initialization Required
+#### 3. MELK Devices
 
 **Problem**: MELK devices don't respond to commands after setup.
 
-**Solution**: MELK devices require initialization commands. Send these via `gatttool` (replace MAC address):
-
-```bash
-sudo gatttool -b XX:XX:XX:XX:XX:XX --char-write-req -a 0x0009 -n 7e0783
-sudo gatttool -b XX:XX:XX:XX:XX:XX --char-write-req -a 0x0009 -n 7e0404
-```
-
-After sending these commands:
-1. Restart the LED strip (power off/on)
-2. Reload the integration in Home Assistant
-3. The device should now work normally
-
-See [Issue #11](https://github.com/dave-code-ruiz/elkbledom/issues/11) for more details.
+**Solution**: The integration sends the required MELK login frames automatically. Disconnect the vendor mobile app, power-cycle the controller, and reload the integration. If it still fails, enable debug logging and verify the selected model and GATT write characteristic.
 
 #### 4. State Not Updating
 
@@ -313,12 +312,12 @@ See [Issue #11](https://github.com/dave-code-ruiz/elkbledom/issues/11) for more 
 **Problem**: Lights are slow to respond or frequently disconnect.
 
 **Solutions**:
-- Reduce the disconnect delay in configuration (try 60 seconds)
+- Keep the default 20-second disconnect delay, or increase it if reconnects are slow
 - Move the Home Assistant device closer to the LED strip
 - Check for Bluetooth interference (WiFi routers, microwaves, etc.)
 - Use a USB Bluetooth adapter with better range
-- Set disconnect delay to `0` (never disconnect) for instant response
-- **Use ESPHome Bluetooth Proxy**: Deploy [ESPHome Bluetooth proxy](https://esphome.io/components/bluetooth_proxy.html) devices (ESP32) closer to your LED strips for extended range and better reliability
+- Avoid delay `0` when proxy connection slots are scarce; it keeps one slot occupied
+- **Use ESPHome Bluetooth Proxy**: Deploy an [ESPHome Bluetooth proxy](https://esphome.io/components/bluetooth_proxy/) closer to your LED strips for extended range and better reliability
   - ESP32 devices act as Bluetooth bridges
   - Significantly improves range and connection stability
   - Cost-effective solution (~$5-10 per ESP32 device)
@@ -342,7 +341,7 @@ logger:
 **Restart Home Assistant**, reproduce the issue, then check the logs:
 - Go to **Settings** → **System** → **Logs**
 - Look for entries with `custom_components.elkbledom`
-- Include relevant log entries when [creating an issue](https://github.com/dave-code-ruiz/elkbledom/issues)
+- Include relevant log entries when [creating an issue](https://github.com/nbetcher/elkbledom/issues)
 
 ---
 
@@ -355,7 +354,7 @@ logger:
 3. Search for **"elkbledom"**
 4. The integration will automatically discover nearby ELK-BLEDOM devices
 5. Select your device from the list
-6. The setup will validate the connection by toggling the light (make sure it's in range!)
+6. Setup verifies a connectable GATT path and compatible characteristics without intentionally changing the light
 7. Complete the setup
 
 > **Note**: Repeat the setup process for each light you want to add.
@@ -369,7 +368,7 @@ After setup, you can configure additional options:
 | Setting | Description | Default | Options |
 |---------|-------------|---------|---------|
 | **Reset color on turn on** | When the LED turns on, reset to white color | `false` | `true` / `false` |
-| **Disconnect delay (seconds)** | Time before disconnecting from the device when idle | `120` | `0` = Never disconnect<br>`30-300` = Seconds |
+| **Disconnect delay (seconds)** | Time before disconnecting from the device when idle | `20` | `0` = Never disconnect<br>`1-86400` = Seconds |
 | **Brightness mode** | How brightness is controlled | `auto` | `auto` = Automatic detection<br>`rgb` = RGB scaling<br>`native` = Device native |
 | **Model** | Override auto-detected device model | Auto-detected | `ELK-BLEDOB`, `ELK-BLEDOM`, `MELK`, `LEDBLE`, `XROCKER`, etc. |
 | **Effects class** | Change the effects list/behavior | Default | Varies by device model |
@@ -386,9 +385,9 @@ After setup, you can configure additional options:
 
 - **Reset color on turn on**: Enable if you want consistent behavior (always starts with white)
 - **Disconnect delay**: 
-  - Set to `0` for instant response but higher battery drain on battery-powered hubs
-  - Set to `120-180` seconds for balance between responsiveness and efficiency
-  - Set to `300+` seconds if you rarely control the lights
+  - Keep `20` for normal local-adapter and proxy use
+  - Increase it if the controller reconnects slowly
+  - Use `0` only when permanently reserving an active proxy connection slot is acceptable
 - **Brightness mode**:
   - Use `auto` for most devices (automatically detects the best method)
   - Use `rgb` if brightness control doesn't work properly
@@ -598,7 +597,7 @@ cards:
           target:
             entity_id: light.elk_bledom
           data:
-            color_temp: 250  # Cool white
+            color_temp_kelvin: 4000
             brightness: 255
       - type: button
         name: Movie
@@ -621,7 +620,7 @@ Contributions are welcome! Here's how you can help:
 
 ### Adding Support for New Devices
 
-1. **Capture BLE traffic** using our [BLE Sniffing Guide](custom_components/elkbledom/sniffing_ble_device.md)
+1. **Capture BLE traffic** using our [BLE Sniffing Guide](sniffing_ble_device.md)
 2. **Analyze the protocol** and identify command structures
 3. **Add model to `models.json`** following existing patterns
 4. **Test thoroughly** with your physical device
@@ -629,7 +628,7 @@ Contributions are welcome! Here's how you can help:
 
 ### Reporting Bugs
 
-1. [Create a new issue](https://github.com/dave-code-ruiz/elkbledom/issues/new)
+1. [Create a new issue](https://github.com/nbetcher/elkbledom/issues/new)
 2. Include:
    - Device model and brand
    - Home Assistant version
@@ -655,10 +654,10 @@ Share the generated JSON in a new issue!
 | Live state polling not supported | Won't Fix | Control only via HA |
 | Only one connection at a time | Limitation | Disconnect mobile app before using HA |
 | TV remote interference | Won't Fix | Cover IR receiver on controller |
-| MELK requires initialization | In Progress | See troubleshooting section |
+| MELK login fails | Device-specific | Power-cycle, disconnect the vendor app, and collect debug logs |
 | Segment control not available | Planned | Coming in future update |
 
-For more details, check the [GitHub Issues](https://github.com/dave-code-ruiz/elkbledom/issues) page.
+For more details, check the [GitHub Issues](https://github.com/nbetcher/elkbledom/issues) page.
 
 ---
 
@@ -710,6 +709,6 @@ If you find this integration useful, consider supporting the development:
 
 **Made for the Home Assistant Community**
 
-[Report Bug](https://github.com/dave-code-ruiz/elkbledom/issues) • [Request Feature](https://github.com/dave-code-ruiz/elkbledom/issues) • [Contribute](https://github.com/dave-code-ruiz/elkbledom/pulls)
+[Report Bug](https://github.com/nbetcher/elkbledom/issues) • [Request Feature](https://github.com/nbetcher/elkbledom/issues) • [Contribute](https://github.com/nbetcher/elkbledom/pulls)
 
 </div>

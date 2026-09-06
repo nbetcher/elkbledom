@@ -10,6 +10,7 @@ set_random_color:
       selector:
         entity:
           domain: light
+          integration: elkbledom
     brightness:
       name: Brightness
       description: Brightness level (0-255)
@@ -34,6 +35,7 @@ set_rgb_color:
       selector:
         entity:
           domain: light
+          integration: elkbledom
     r:
       name: Red
       description: Red value (0-255)

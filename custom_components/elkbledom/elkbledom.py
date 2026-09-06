@@ -34,15 +34,29 @@ import logging
 
 from homeassistant.core import callback
 
-# Re-exported so ``from .elkbledom import DeviceData`` (config_flow.py:3) keeps
-# resolving after the class moved to device_data.py (§2.5 / §4.7). Do NOT remove.
-from .device_data import DeviceData  # noqa: F401  (re-export)
-from .state import ElkState
-from .protocol import ElkProtocol
-from .transport import BLETransport
 from .device import ElkDevice
 
+# Re-exported so ``from .elkbledom import DeviceData`` (config_flow.py:3) keeps
+# resolving after the class moved to device_data.py (§2.5 / §4.7). Do NOT remove.
+from .device_data import DeviceData
+from .protocol import ElkProtocol
+from .state import ElkState
+from .transport import (
+    BLETransport,
+    CharacteristicMissingError,
+    NotConnectedError,
+    UnsupportedCommandError,
+)
+
 LOGGER = logging.getLogger(__name__)
+
+__all__ = (
+    "BLEDOMInstance",
+    "CharacteristicMissingError",
+    "DeviceData",
+    "NotConnectedError",
+    "UnsupportedCommandError",
+)
 
 
 class BLEDOMInstance:
@@ -55,8 +69,16 @@ class BLEDOMInstance:
     internals directly.
     """
 
-    def __init__(self, address, reset: bool, delay: int, hass, forced_model: str = None,
-                 brightness_mode: str = "auto", config_name: str = None) -> None:
+    def __init__(
+        self,
+        address,
+        reset: bool,
+        delay: int,
+        hass,
+        forced_model: str | None = None,
+        brightness_mode: str = "auto",
+        config_name: str | None = None,
+    ) -> None:
         # Signature IDENTICAL to the god object (elkbledom.py:140). Two positional
         # call sites: __init__.py:120 (7 args) and config_flow.py:265 (5 args,
         # relying on the brightness_mode="auto" / config_name=None defaults).
@@ -92,8 +114,9 @@ class BLEDOMInstance:
         self._device = ElkDevice(self._transport, self._protocol, self._state, brightness_mode)
 
         LOGGER.debug(
-            'Model information for device %s : ModelNo %s, Turn on cmd %s, Turn off cmd %s, rssi %s',
-            self.name, self.model_name,
+            "Model information for %s: model %s, on %s, off %s, RSSI %s",
+            self.name,
+            self.model_name,
             self.model.get_turn_on_cmd(self.model_name),
             self.model.get_turn_off_cmd(self.model_name),
             self.rssi,
@@ -214,6 +237,10 @@ class BLEDOMInstance:
     def transport(self):
         """The BLETransport (connection/availability/callback registry)."""
         return self._transport
+
+    def batch(self):
+        """Return a context that serializes one multi-intent device action."""
+        return self._transport.batch()
 
     # ------------------------------------------------------------------ #
     # Async intents: straight delegation to ElkDevice (§4.3)             #

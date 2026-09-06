@@ -25,7 +25,7 @@ from homeassistant.components.bluetooth import async_discovered_service_info
 from .protocol import ElkProtocol
 
 
-class DeviceData():
+class DeviceData:
     def __init__(self, hass, discovery_info):
         self._discovery = discovery_info
         self._supported = ElkProtocol.is_supported(hass, self._discovery.name)
@@ -55,9 +55,6 @@ class DeviceData():
         return self._rssi
 
     def update_device(self) -> None:
-        #TODO for discovery_info in async_last_service_info(self._hass, self._address):
-        for discovery_info in async_discovered_service_info(self._hass):
-            if discovery_info.address == self._address:
+        for discovery_info in async_discovered_service_info(self._hass, connectable=True):
+            if discovery_info.address.casefold() == self._address.casefold():
                 self._rssi = discovery_info.rssi
-                ##TODO SOMETHING WITH DEVICE discovery_info
-        return

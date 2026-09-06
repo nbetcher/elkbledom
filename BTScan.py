@@ -19,6 +19,20 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
 
+
+def _write_response_required(client: BleakClient, characteristic: str) -> bool:
+    """Return the write mode advertised by a discovered characteristic."""
+    resolved = client.services.get_characteristic(characteristic)
+    if resolved is None:
+        raise ValueError(f"Write characteristic {characteristic} is unavailable")
+    properties = set(resolved.properties)
+    if "write-without-response" in properties:
+        return False
+    if "write" in properties:
+        return True
+    raise ValueError(f"Characteristic {characteristic} is not writable")
+
+
 # Load models.json to get all known commands
 def load_models_json():
     """Load all known models and extract unique commands"""
@@ -268,12 +282,8 @@ class LEDStripDiscovery:
                     print(f"Device {device.name} requires special login procedure...")
                     print("Getting initial services to find write characteristic...\n")
                     
-                    # Force service discovery
-                    try:
-                        temp_services = await client.get_services()
-                    except Exception as e:
-                        print(f"Could not get services for login: {e}")
-                        temp_services = client.services
+                    # Bleak completes service discovery as part of connecting.
+                    temp_services = client.services
                     
                     write_char = None
                     read_char = None
@@ -300,10 +310,18 @@ class LEDStripDiscovery:
                         # Execute login sequence
                         print("Executing login commands...")
                         try:
-                            await client.write_gatt_char(write_char, bytes([0x7e, 0x07, 0x83]), response=False)
+                            await client.write_gatt_char(
+                                write_char,
+                                bytes([0x7e, 0x07, 0x83]),
+                                response=_write_response_required(client, write_char),
+                            )
                             print("  ✓ Sent: 7e 07 83")
                             await asyncio.sleep(1)
-                            await client.write_gatt_char(write_char, bytes([0x7e, 0x04, 0x04]), response=False)
+                            await client.write_gatt_char(
+                                write_char,
+                                bytes([0x7e, 0x04, 0x04]),
+                                response=_write_response_required(client, write_char),
+                            )
                             print("  ✓ Sent: 7e 04 04")
                             await asyncio.sleep(1)
                             print("✓ Login procedure completed!\n")
@@ -457,9 +475,17 @@ class LEDStripDiscovery:
         if device.name and (device.name.lower().startswith("melk") or device.name.lower().startswith("modelx")):
             try:
                 print("Executing login procedure...")
-                await client.write_gatt_char(char_uuid, bytes([0x7e, 0x07, 0x83]), response=False)
+                await client.write_gatt_char(
+                    char_uuid,
+                    bytes([0x7e, 0x07, 0x83]),
+                    response=_write_response_required(client, char_uuid),
+                )
                 await asyncio.sleep(1)
-                await client.write_gatt_char(char_uuid, bytes([0x7e, 0x04, 0x04]), response=False)
+                await client.write_gatt_char(
+                    char_uuid,
+                    bytes([0x7e, 0x04, 0x04]),
+                    response=_write_response_required(client, char_uuid),
+                )
                 await asyncio.sleep(1)
                 print("Login completed!\n")
             except Exception as e:
@@ -477,7 +503,11 @@ class LEDStripDiscovery:
             # Turn on the strip first if a working turn_on command is provided
             if turn_on_first is not None:
                 try:
-                    await client.write_gatt_char(char_uuid, bytes(turn_on_first), response=False)
+                    await client.write_gatt_char(
+                        char_uuid,
+                        bytes(turn_on_first),
+                        response=_write_response_required(client, char_uuid),
+                    )
                     await asyncio.sleep(0.3)  # Wait for the strip to turn on
                 except Exception as e:
                     print(f"   [WARNING] Could not turn on strip before test: {e}")
@@ -488,7 +518,11 @@ class LEDStripDiscovery:
             print(f"\nTesting: {description}")
             print(f"   Command: {cmd_hex}")
             
-            await client.write_gatt_char(char_uuid, cmd_bytes, response=False)
+            await client.write_gatt_char(
+                char_uuid,
+                cmd_bytes,
+                response=_write_response_required(client, char_uuid),
+            )
             await asyncio.sleep(0.3)  # Wait a bit between commands
             
             if ask_user:
@@ -504,7 +538,11 @@ class LEDStripDiscovery:
                     elif response == 'r':
                         print("   [RETRY] Relaunching command...")
                         if client.is_connected:
-                            await client.write_gatt_char(char_uuid, cmd_bytes, response=False)
+                            await client.write_gatt_char(
+                                char_uuid,
+                                cmd_bytes,
+                                response=_write_response_required(client, char_uuid),
+                            )
                             await asyncio.sleep(0.3)
                         else:
                             print("   [ERROR] Not connected, cannot retry")
@@ -649,7 +687,11 @@ class LEDStripDiscovery:
                         try:
                             cmd_hex = ' '.join(f'{b:02x}' for b in working_turn_on_cmd)
                             print(f"Sending turn on command: {cmd_hex}")
-                            await client.write_gatt_char(char_uuid, bytes(working_turn_on_cmd), response=False)
+                            await client.write_gatt_char(
+                                char_uuid,
+                                bytes(working_turn_on_cmd),
+                                response=_write_response_required(client, char_uuid),
+                            )
                             await asyncio.sleep(0.5)
                             print("[OK] Strip is now ON and ready for color/white tests\n")
                         except Exception as e:
@@ -934,7 +976,11 @@ class LEDStripDiscovery:
                         print(f"  Command: {cmd_hex}")
                         
                         try:
-                            await client.write_gatt_char(char_uuid, bytes(cmd), response=False)
+                            await client.write_gatt_char(
+                                char_uuid,
+                                bytes(cmd),
+                                response=_write_response_required(client, char_uuid),
+                            )
                             await asyncio.sleep(0.5)  # Wait for potential response
                             
                             if notification_received:
@@ -1238,7 +1284,10 @@ async def main() -> None:
         if response == 'y':
             discovery.generate_report()
         
-        print("\nProcess completed if you discover commands to turn on an turn off you can post your final report in https://github.com/dave-code-ruiz/elkbledom/issues !")
+        print(
+            "\nIf you discover working power commands, post the final report at "
+            "https://github.com/nbetcher/elkbledom/issues"
+        )
         
     except KeyboardInterrupt:
         print("\n\nProcess interrupted by user")

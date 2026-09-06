@@ -1,41 +1,42 @@
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.number import (
     NumberEntity,
 )
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .coordinator import ElkCoordinator
 from .entity import BLEDOMEntity
-from .const import DOMAIN
-
-from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-
-
-import logging
 
 LOG = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0  # BLETransport serializes intents for each physical device.
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data.coordinator
     instance = coordinator.instance
-    entities = [BLEDOMMicSensitivity(coordinator, "Mic Sensitivity " + config_entry.data["name"], config_entry.entry_id)]
+    entities = [BLEDOMMicSensitivity(coordinator)]
     if instance.model.get_effect_speed_cmd(instance.model_name, 50):
-        entities.append(BLEDOMEffectSpeed(coordinator, "Effect Speed " + config_entry.data["name"], config_entry.entry_id))
+        entities.append(BLEDOMEffectSpeed(coordinator))
     async_add_entities(entities)
+
 
 class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
     """Effect Speed entity"""
 
-    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry_id: str) -> None:
+    _attr_translation_key = "effect_speed"
+
+    def __init__(self, coordinator: ElkCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_effect_speed"
         self._effect_speed = 0
 
@@ -69,26 +70,31 @@ class BLEDOMEffectSpeed(BLEDOMEntity, RestoreEntity, NumberEntity):
     async def async_added_to_hass(self) -> None:
         """Restore previous state when entity is added to hass."""
         await super().async_added_to_hass()
-        
+
         # Restore the last known effect speed
         if (last_state := await self.async_get_last_state()) is not None:
             try:
-                self._effect_speed = int(float(last_state.state))
+                self._effect_speed = max(0, min(int(float(last_state.state)), 100))
+                self._instance.state.restore(effect_speed=self._effect_speed)
                 LOG.debug(f"Restored effect speed for {self.name}: {self._effect_speed}")
             except (ValueError, TypeError):
                 LOG.debug(f"Could not restore effect speed for {self.name}, using default")
 
+
 class BLEDOMMicSensitivity(BLEDOMEntity, RestoreEntity, NumberEntity):
     """Microphone Sensitivity entity"""
 
-    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry_id: str) -> None:
+    _attr_translation_key = "mic_sensitivity"
+
+    def __init__(self, coordinator: ElkCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_sensitivity"
         self._mic_sensitivity = 50
         # Disabled by default unless the model opts into mic support, so
         # unsupported strips don't show a non-functional control.
-        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
+        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(
+            self._instance.model_name
+        )
 
     @property
     def native_value(self) -> int | None:
@@ -122,7 +128,7 @@ class BLEDOMMicSensitivity(BLEDOMEntity, RestoreEntity, NumberEntity):
         # Restore the last known mic sensitivity
         if (last_state := await self.async_get_last_state()) is not None:
             try:
-                self._mic_sensitivity = int(float(last_state.state))
+                self._mic_sensitivity = max(0, min(int(float(last_state.state)), 100))
                 LOG.debug(f"Restored mic sensitivity for {self.name}: {self._mic_sensitivity}")
             except (ValueError, TypeError):
                 LOG.debug(f"Could not restore mic sensitivity for {self.name}, using default (50)")

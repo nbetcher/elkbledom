@@ -1,30 +1,29 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .coordinator import ElkCoordinator
 from .entity import BLEDOMEntity
-from .const import DOMAIN
-
-import logging
 
 LOG = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0  # BLETransport serializes intents for each physical device.
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
-    async_add_entities([
-        BLEDOMMicSwitch(coordinator, "Mic Enable " + config_entry.data["name"], config_entry.entry_id)
-    ])
+    coordinator = config_entry.runtime_data.coordinator
+    async_add_entities([BLEDOMMicSwitch(coordinator)])
+
 
 class BLEDOMMicSwitch(BLEDOMEntity, RestoreEntity, SwitchEntity):
     """Microphone (music-mode) enable switch.
@@ -42,13 +41,15 @@ class BLEDOMMicSwitch(BLEDOMEntity, RestoreEntity, SwitchEntity):
 
     # Optimistic (no readback): show an explicit on/off control.
     _attr_assumed_state = True
+    _attr_translation_key = "microphone"
 
-    def __init__(self, coordinator: ElkCoordinator, attr_name: str, entry_id: str) -> None:
+    def __init__(self, coordinator: ElkCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_name = attr_name
         self._attr_unique_id = self._instance.address + "_mic_enable"
         # Disabled by default unless the model opts into mic support.
-        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(self._instance.model_name)
+        self._attr_entity_registry_enabled_default = self._instance.model.get_supports_mic(
+            self._instance.model_name
+        )
 
     @property
     def is_on(self) -> bool:
@@ -71,6 +72,8 @@ class BLEDOMMicSwitch(BLEDOMEntity, RestoreEntity, SwitchEntity):
         # normal command still emits an explicit mic-off (harmless if the strip
         # was power-cycled out of music mode -- mic-off on a static strip is a
         # no-op).
-        if (last_state := await self.async_get_last_state()) is not None and last_state.state == "on":
+        if (
+            last_state := await self.async_get_last_state()
+        ) is not None and last_state.state == "on":
             self._instance.state.restore(mic_enabled=True)
             LOG.debug(f"Restored mic state for {self.name}: ON")

@@ -1,29 +1,30 @@
+"""Constants and asynchronously populated effect definitions."""
+
 from enum import Enum
-import json
-from pathlib import Path
 
 DOMAIN = "elkbledom"
 CONF_RESET = "reset"
 CONF_DELAY = "delay"
 CONF_MODEL = "model"
+AUTOMATIC_MODEL = "__automatic__"
 CONF_EFFECTS_CLASS = "effects_class"
 
-# Defaults for config/options
 DEFAULT_RESET = False
-DEFAULT_DELAY = 120
-# Connection-timeout (idle disconnect) bounds, in seconds. 0 = never disconnect
-# (keep the BLE connection alive). There is no hard device/protocol limit, so the
-# upper bound is a sane cap -- 1 hour; anything longer is effectively "never", for
-# which 0 exists. Values outside this range are clamped, not rejected.
+DEFAULT_DELAY = 20
 MIN_DELAY = 0
-MAX_DELAY = 3600
+MAX_DELAY = 86400
 
-# Brightness mode configuration
 CONF_BRIGHTNESS_MODE = "brightness_mode"
 BRIGHTNESS_MODES = ["auto", "rgb", "native"]
 DEFAULT_BRIGHTNESS_MODE = "auto"
-class MIC_EFFECTS (Enum):
-    # Microphone Effects (0x80-0x87)
+
+CONFIG_ENTRY_VERSION = 1
+CONFIG_ENTRY_MINOR_VERSION = 2
+
+
+class MIC_EFFECTS(Enum):
+    """Microphone effects shared by the entity platform."""
+
     mic_energic = 0x80
     mic_rhythm = 0x81
     mic_spectrum = 0x82
@@ -33,18 +34,13 @@ class MIC_EFFECTS (Enum):
     mic_effect_6 = 0x86
     mic_effect_7 = 0x87
 
-MIC_EFFECTS_list = [
-    'mic_energic',
-    'mic_rhythm',
-    'mic_spectrum',
-    'mic_rolling',
-    'mic_effect_4',
-    'mic_effect_5',
-    'mic_effect_6',
-    'mic_effect_7'
-    ]
 
-class WEEK_DAYS (Enum):
+MIC_EFFECTS_list = [member.name for member in MIC_EFFECTS]
+
+
+class WEEK_DAYS(Enum):
+    """Scheduler weekday mask."""
+
     monday = 0x01
     tuesday = 0x02
     wednesday = 0x04
@@ -52,53 +48,56 @@ class WEEK_DAYS (Enum):
     friday = 0x10
     saturday = 0x20
     sunday = 0x40
-    all = (0x01 + 0x02 + 0x04 + 0x08 + 0x10 + 0x20 + 0x40)
-    week_days = (0x01 + 0x02 + 0x04 + 0x08 + 0x10)
-    weekend_days = (0x20 + 0x40)
+    all = 0x7F
+    week_days = 0x1F
+    weekend_days = 0x60
     none = 0x00
 
-#print(EFFECTS.blink_red.value)
 
-# Load effects definitions from definitions.json
-def _load_effects_from_json():
-    """Load effects definitions and lists from definitions.json"""
-    definitions_file = Path(__file__).parent / "definitions.json"
-    try:
-        with open(definitions_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            effects_defs = data.get("effects_definitions", {})
-            effects_lists = data.get("effects_lists", {})
-            
-            # Create Enum classes dynamically for all effects definitions
-            effects_enums = {}
-            for effect_class_name, effect_values in effects_defs.items():
-                effects_enums[effect_class_name] = Enum(effect_class_name, effect_values)
-            
-            return effects_enums, effects_lists
-    except Exception as e:
-        # Fallback to empty dicts if file doesn't exist or can't be loaded
-        return {}, {}
+# Filled by ensure_models_loaded on Home Assistant's executor. Keeping these
+# containers stable is important because platform modules import their objects.
+EFFECTS = Enum("EFFECTS", {})
+EFFECTS_list: list[str] = []
+EFFECTS_MAP: dict[str, type[Enum]] = {}
+EFFECTS_LIST_MAP: dict[str, list[str]] = {}
 
-_effects_enums, _effects_lists_data = _load_effects_from_json()
 
-# Export all effect classes and lists dynamically
-# This allows adding new effects in models.json without changing this file
-globals().update(_effects_enums)  # EFFECTS, EFFECTS_MELK, EFFECTS_MELK_OF10, etc.
-globals().update(_effects_lists_data)  # EFFECTS_list, EFFECTS_list_MELK, etc.
+def effects_list_name_for_class(class_name: str) -> str:
+    """Return the definitions-list key paired with an effects enum class."""
+    if class_name == "EFFECTS":
+        return "EFFECTS_list"
+    if class_name.startswith("EFFECTS_"):
+        return f"EFFECTS_list_{class_name.removeprefix('EFFECTS_')}"
+    return f"{class_name}_list"
 
-# Guarantee the import-critical names always exist, even if definitions.json is
-# missing or corrupt. Without this, the dynamic globals().update() above would
-# leave `EFFECTS` / `EFFECTS_list` undefined and the static imports in light.py
-# and config_flow.py would raise ImportError, breaking the whole integration.
-if "EFFECTS" not in globals():
-    EFFECTS = Enum("EFFECTS", {"none": 0})
-    _effects_enums["EFFECTS"] = EFFECTS
-if "EFFECTS_list" not in globals():
-    EFFECTS_list = ["none"]
-    _effects_lists_data["EFFECTS_list"] = EFFECTS_list
 
-# Create EFFECTS_MAP with all dynamically loaded effect classes
-EFFECTS_MAP = _effects_enums.copy()
+def populate_effects_from_data(definitions: dict) -> None:
+    """Populate effect registries from JSON already read off the event loop."""
+    effects_defs = definitions.get("effects_definitions", {}) or {}
+    effects_lists = definitions.get("effects_lists", {}) or {}
 
-# Create EFFECTS_LIST_MAP with all dynamically loaded effect lists
-EFFECTS_LIST_MAP = _effects_lists_data.copy()
+    effect_enums = {}
+    for class_name, values in effects_defs.items():
+        effect_enums[class_name] = Enum(class_name, values)
+
+    effect_lists = {}
+    for list_name, list_values in effects_lists.items():
+        effect_lists[list_name] = list(list_values)
+
+    for class_name, effect_enum in effect_enums.items():
+        list_name = effects_list_name_for_class(class_name)
+        if list_name not in effect_lists or not set(effect_lists[list_name]).issubset(
+            effect_enum.__members__
+        ):
+            raise ValueError(f"Effect definitions and list do not match: {class_name}")
+    if not effect_enums.get("EFFECTS") or not effect_lists.get("EFFECTS_list"):
+        raise ValueError("Default effect definitions are missing")
+
+    EFFECTS_MAP.clear()
+    EFFECTS_MAP.update(effect_enums)
+    EFFECTS_LIST_MAP.clear()
+    EFFECTS_LIST_MAP.update(effect_lists)
+
+    # Mutate the imported fallback list instead of replacing it.
+    EFFECTS_list.clear()
+    EFFECTS_list.extend(EFFECTS_LIST_MAP.get("EFFECTS_list", []))

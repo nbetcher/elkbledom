@@ -435,7 +435,7 @@ Once you have captured the traffic, please share:
 ### How to Share
 
 **Option 1: GitHub Issue**
-1. Create a new issue at [github.com/dave-code-ruiz/elkbledom/issues](https://github.com/dave-code-ruiz/elkbledom/issues)
+1. Create a new issue at [github.com/nbetcher/elkbledom/issues](https://github.com/nbetcher/elkbledom/issues)
 2. Title: "New device support: [Device Name] - [Model Number if known]"
 3. Attach the capture file (GitHub allows up to 25MB)
 4. Include output from BTScan.py or easyBTScan.py
@@ -504,7 +504,7 @@ BLE captures may contain:
 
 ### Community
 
-- **GitHub Issues**: [github.com/dave-code-ruiz/elkbledom/issues](https://github.com/dave-code-ruiz/elkbledom/issues)
+- **GitHub Issues**: [github.com/nbetcher/elkbledom/issues](https://github.com/nbetcher/elkbledom/issues)
 - **Home Assistant Community**: [community.home-assistant.io](https://community.home-assistant.io/)
 - **Reddit**: r/homeassistant, r/bluetooth
 
